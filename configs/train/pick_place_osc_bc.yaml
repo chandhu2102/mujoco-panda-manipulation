@@ -1,0 +1,217 @@
+# Pick-and-place under task-space (OSC) control, warm-started from the scripted
+# task-space demonstrations, with a DAPG-style auxiliary BC term.
+#
+#   1. python scripts/pretrain_bc.py --config configs/train/pick_place_osc_bc.yaml \
+#          --demos demos/pick_place_osc.npz --out outputs/pick_place_osc_bc
+#   2. python scripts/train.py --config configs/train/pick_place_osc_bc.yaml \
+#          --resume outputs/pick_place_osc_bc
+#
+# This is the composition configs/train/pick_place_osc.yaml describes in its
+# trailing comment, made concrete. It is a separate file rather than an edit so
+# the OSC-alone baseline stays runnable and the two remain comparable.
+#
+# What the 10M-step pick_place_velocity run established, and why each of those
+# findings shows up as a line below:
+#
+#   * Stage-conditioned success ended at stage2 = 1.00, stage1 = 0.17,
+#     stage0 = 0.13. The transport-and-place segment is fully learnable; what the
+#     policy never found was how to *enter* it. That is an exploration problem at
+#     the grasp, which is exactly what demonstrations address and what no amount
+#     of additional PPO steps in that action space did.
+#   * action_std_mean rode its 1.0 ceiling from ~iteration 730 to the end
+#     (train/action_std_clamped was nonzero for thousands of iterations) and
+#     entropy sat at 11.15 = 8 * (0.5*ln(2*pi*e) + ln 0.975), i.e. the analytic
+#     maximum for this ceiling. An ent_coef of 0.01 over an 8-D action space
+#     bought noise the advantage signal could not pay back. Hence the narrowed
+#     policy and entropy blocks, following pick_place_bc_torque.yaml.
+#   * rollout/dist/object_to_goal never left 0.19-0.20 m in 10M steps while
+#     lift_height *fell* from 0.047 to 0.014 m, and the lift/place reward shares
+#     collapsed through the window where velocity_penalty was ramping 0.005 ->
+#     0.015. Hence the flat penalty below. This is a deliberate deviation from
+#     pick_place_osc.yaml; revert it to start/end 0.005/0.015 if you want the
+#     ramp back as a separate variable.
+#   * train/grad_norm ran 500-3100 against max_grad_norm 0.5, driven by a value
+#     loss of 4000-7600 on an unnormalized return scale of ~350-500. Adam absorbs
+#     a *constant* rescale; it does not absorb one that swings 4x between
+#     iterations on critic-loss spikes. Raising the clip stops the actor's
+#     effective step size from being modulated by the critic. The deeper fix is
+#     return scaling -- NormalizeReward exists in algos/common/normalizers.py but
+#     is deliberately unwired, so it is a code change, not a key here.
+
+run_name: pick_place_osc_bc
+output_dir: outputs
+
+seed: 0
+device: cpu
+
+env:
+  task: pick_place
+  num_envs: 16
+
+  # Required by TaskSpaceWrapper: the IK emits a joint *angle* target.
+  control_mode: joint_position
+  control_dt: 0.04
+  max_episode_steps: 250
+  reset_pose: ready_low
+  gravity_compensation: true      # not optional under joint_position
+  terminate_on_success: false
+  async_envs: false
+
+  # Level 1, as in both parent configs. With demonstrations supplying the grasp
+  # there is no reason to hand the policy an already-grasped object, and level 2's
+  # seeded starts are off the demonstration distribution -- early rollouts would
+  # pull the policy away from what it was just cloned to. Note the velocity run's
+  # own evidence for this: its stage-2 rate saturated at 1.00 without ever
+  # transferring down to stage 1.
+  curriculum_level: 1
+
+  task_space:
+    enabled: true
+    max_delta_pos: 0.012
+    max_delta_width: 0.010
+    workspace_low: [0.30, -0.28, 0.42]
+    workspace_high: [0.68, 0.28, 0.75]
+    leash: 0.05
+    wrist_yaw: track_object
+    posture_gain: 0.15
+    effort_penalty: 0.01
+
+  reward:
+    # MUST be 0 under joint_position control; TaskSpaceWrapper raises otherwise.
+    action_penalty: 0.0
+    velocity_penalty: 0.005
+
+normalize_obs:
+  enabled: true
+  clip: 10.0
+  # pretrain_bc.py fits these on the demonstration set and writes
+  # checkpoints/obs_normalizer.npz beside the BC checkpoint; --resume loads it.
+  # If that file goes missing train.py only warns, and the symptom is BC
+  # appearing to have accomplished nothing rather than an error.
+
+policy:
+  hidden_sizes: [256, 256]
+  activation: tanh
+  shared_torso: false
+
+  # ln(0.3) = -1.204. A clone is only useful if the noise on top of it does not
+  # swamp it; at sigma 0.61 the sampled delta is dominated by exploration and the
+  # cloned mean stops being what executes.
+  log_std_init: -1.204
+
+  state_dependent_std: false
+  squash: false
+
+  # 0.5, not the 1.0 the from-scratch configs use. 1.0 is the ceiling the
+  # velocity run pinned to for 7M steps.
+  action_std_ceiling: 0.5
+
+anneal:
+  enabled: true
+  rebase_on_resume: false
+
+  # An order of magnitude below the from-scratch 0.01. Entropy is bought to
+  # escape a state with no gradient; after BC there is gradient, and the same
+  # bonus now mostly widens sigma away from the cloned mean.
+  ent_coef:
+    start: 0.001
+    end: 0.0001
+
+  # Flat, for the reason given in the header. No action_penalty entry: the
+  # annealer calls set_reward_weights, so listing it would write a non-zero
+  # action_penalty back into the envs one iteration in -- past TaskSpaceWrapper's
+  # construction-time check -- and silently reinstate the joint-pose prior.
+  penalties:
+    velocity_penalty:
+      start: 0.005
+      end: 0.005
+      ramp_start: 0.5
+
+ppo:
+  total_timesteps: 10000000
+  num_steps: 256
+  num_minibatches: 32
+  update_epochs: 10
+
+  # 1e-4, not 3e-4. The first updates after a resume act on a policy that already
+  # encodes a solution, against a critic that has only seen the demonstration
+  # distribution. A large step there is how a warm start gets spent.
+  learning_rate: 1.0e-4
+
+  anneal_lr: true
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  clip_vloss: true
+  ent_coef: 0.001
+  vf_coef: 0.5
+
+  # 10.0, not 0.5. See the header: at 0.5 every update in the velocity run was
+  # rescaled by a factor that varied 1000x-6000x between iterations according to
+  # the critic's loss spike, which modulates the actor's step size for reasons
+  # that have nothing to do with the actor.
+  max_grad_norm: 10.0
+
+  target_kl: 0.02
+  normalize_advantage: true
+
+  success_threshold: 0.75
+  success_window: 100
+
+  eval_interval: 20
+  checkpoint_interval: 50
+  log_interval: 10
+
+  # Must stay false with the bc block active: the auxiliary term draws a fresh
+  # demonstration minibatch every update, so a fused loss would recompile.
+  compile_update: false
+
+# Auxiliary behavioural-cloning term inside the PPO update (DAPG-style).
+#
+# Pre-training alone is fragile: nothing in the PPO objective preserves the
+# cloned behaviour, and the iterations where it is least protected are the first
+# ones, where the advantage estimates are worst. A decaying likelihood term
+# anchors the policy while the value function catches up.
+bc:
+  enabled: true
+  # The 400-episode set, matching what pretrain_bc.py is run on. Repointed from
+  # demos/pick_place_osc.npz (40 episodes): train.py reads this key to build the
+  # DAPG anchor buffer, so a mismatch here anchors PPO to a different dataset
+  # than the clone was fitted on. The shape check downstream does not catch it --
+  # both sets are 48/4 -- so it fails silently.
+  demos: demos/pick_place_osc_400.npz
+
+  # 0.1 decayed geometrically per iteration: 0.999^1000 = 0.37,
+  # 0.999^2441 = 0.087 over this budget's ~2441 iterations.
+  coef: 0.1
+  decay: 0.999
+  batch_size: 256
+
+  # Consumed by scripts/pretrain_bc.py, not by the PPO stage. 140 is the minimum
+  # of holdout action MSE on demos/pick_place_osc_400.npz at an 80/20
+  # episode-boundary split with the observation normalizer fitted on the training
+  # partition only (sweep_holdout.py, seed 0). Over 60/80/100/140/180/220/300/400:
+  #
+  #   .033809 .031499 .031334 .030188 .030775 .031575 .033881 .035387
+  #
+  # A real interior vertex -- 100 is 3.8% worse, 180 is 1.9% worse -- but from one
+  # seed, and 140-180 differ by less than 2%, so treat this as "the low 100s to
+  # ~180", not a sharp optimum.
+  #
+  # This was 100 before DemoBuffer.epochs() started dropping the undersized tail
+  # batch. 40961 % 256 == 1, so every epoch used to end with a full-magnitude
+  # clipped step off a single transition; the damage grew with epoch count and so
+  # pulled the apparent optimum down to 100. See DemoBuffer.epochs.
+  #
+  # Holdout value-head EV is flat at ~0.24-0.26 from 80 epochs on (0.32 at 60), so
+  # unlike the pre-fix curve the critic no longer argues for a shorter fit.
+  epochs: 140
+
+eval:
+  n_episodes: 20
+  deterministic: true
+  base_seed: 1000000
+
+early_stop:
+  enabled: false
+  consecutive: 2

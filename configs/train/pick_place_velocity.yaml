@@ -1,0 +1,154 @@
+# Pick-and-place under joint *velocity* control.
+#
+#   python scripts/train.py --config configs/train/pick_place_velocity.yaml --smoke
+#   python scripts/train.py --config configs/train/pick_place_velocity.yaml
+#
+# The minimal-diff pivot from configs/train/pick_place_10m.yaml: same 8-D action
+# space, same policy, same reward structure, one changed line in `control_mode`.
+# Use this as the controlled comparison against pick_place_osc.yaml -- it isolates
+# what the integration order of the action is worth, without also changing the
+# action space, the observation, or who solves the wrist alignment.
+#
+# What changes physically. PandaRobot.apply_velocity closes the loop as
+# `tau = VELOCITY_KP * (v_target - qvel)`, with VELOCITY_KP = 0.6 * torque limits,
+# recomputed every substep (500 Hz) against a target held at 25 Hz:
+#
+#   * `action = 0` now *brakes* rather than coasts. Under torque control a zero
+#     action leaves the arm ballistic (gravity is compensated separately), so
+#     exploration noise integrates twice into position and a stationary tool
+#     centre point is a state the policy has to actively maintain. Here it is the
+#     default.
+#   * One integration instead of two. Position variance under zero-mean action
+#     noise grows linearly in the number of steps rather than cubically, so the
+#     tool centre point stays in the neighbourhood the reach term is shaping.
+#   * The P law is a first-order low-pass on the command. With effective inertias
+#     of ~0.1-2 kg m^2 against VELOCITY_KP of 7.2-52.2, the velocity time constant
+#     M/kp is on the order of 15-40 ms against a 40 ms control period, so an
+#     action reversal takes about one control period to express and per-step
+#     command chatter is attenuated rather than transmitted to the joint.
+#   * Contact: the law resists being pushed. A pad reaction force during closure
+#     produces a bounded velocity rather than an unbounded acceleration. Note this
+#     is damping, not stiffness -- the arm still drifts under a sustained load, it
+#     just drifts at a bounded rate. Only joint_position (pick_place_osc.yaml) has
+#     genuine positional stiffness.
+#
+# Read the penalty block below before changing it; the two penalties do not mean
+# what they meant under torque control.
+
+run_name: pick_place_velocity
+output_dir: outputs
+
+seed: 0
+device: cpu
+
+env:
+  task: pick_place
+  num_envs: 16
+  control_mode: velocity
+  control_dt: 0.04
+  max_episode_steps: 250
+  reset_pose: ready_low
+  gravity_compensation: true
+  terminate_on_success: false
+  async_envs: false
+  curriculum_level: 2
+
+  # Metres of jaw width per control step. Independent of control_mode and, on the
+  # evidence, the single most consequential line in this file: without it, an
+  # action step from +1 to -1 drives the jaw from 0.080 m to 0.005 m inside one
+  # 40 ms interval (~1.9 m/s), which ejects a resting cube instead of gripping it
+  # -- both pads report contact while the width passes straight through the
+  # 0.02-0.052 m band is_grasped requires. A policy exploring at sigma ~1.0 does
+  # that on any step it samples a negative gripper action, so the grasp was not
+  # just hard to find in the aborted run, the action that should produce it
+  # destroyed the state it needed. 0.01 spreads the closure over 8 steps.
+  gripper_rate_limit: 0.01
+
+  reward:
+    # Deliberately asymmetric, and not the 0.005/0.005 of the torque config.
+    #
+    # Under velocity control the action *is* a commanded speed, and the P law
+    # tracks it with a time constant shorter than the control period -- so
+    # `sum(action^2)` and `sum((qvel/limits)^2)` measure very nearly the same
+    # physical quantity, and charging 0.005 for each is charging 0.010 for one
+    # thing. Worse, both now penalize *making progress* rather than penalizing
+    # effort: under torque control action_penalty priced acceleration, and holding
+    # a pose was free either way; here the cheapest policy is a stationary one.
+    #
+    # So: keep one speed penalty, not two. velocity_penalty is the one to keep
+    # because it measures the arm rather than the command, and is therefore still
+    # meaningful if the controller is changed again.
+    action_penalty: 0.0
+    velocity_penalty: 0.005
+
+normalize_obs:
+  enabled: true
+  clip: 10.0
+
+policy:
+  hidden_sizes: [256, 256]
+  activation: tanh
+  shared_torso: false
+  log_std_init: -0.5
+  state_dependent_std: false
+  squash: false
+
+  # Retained, and it means something different now. sigma = 1.0 under torque
+  # control is near-uniform bang-bang over +-87 Nm; here it is near-uniform over
+  # +-2.175 rad/s of commanded joint speed. That is still wild, but it is wild in
+  # a space where the reward's velocity penalty and the joint limits both push
+  # back proportionally, instead of one where a saturated torque compounds into an
+  # unbounded joint_limit_penalty (which is the one unbounded term in the reward).
+  action_std_ceiling: 1.0
+
+anneal:
+  enabled: true
+  rebase_on_resume: false
+
+  ent_coef:
+    start: 0.01
+    end: 0.001
+
+  # Only velocity_penalty is scheduled, matching the reward block: annealing
+  # action_penalty up from 0.0 would reintroduce the double-charge the block above
+  # removes, one iteration into the run and invisibly, since set_reward_weights
+  # runs after TaskSpaceWrapper-style construction checks are long past.
+  penalties:
+    velocity_penalty:
+      start: 0.005
+      end: 0.015
+      ramp_start: 0.5
+
+ppo:
+  total_timesteps: 10000000
+  num_steps: 256
+  num_minibatches: 32
+  update_epochs: 10
+  learning_rate: 3.0e-4
+  anneal_lr: true
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  clip_vloss: true
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  target_kl: 0.02
+  normalize_advantage: true
+
+  success_threshold: 0.75
+  success_window: 100
+
+  eval_interval: 20
+  checkpoint_interval: 50
+  log_interval: 10
+  compile_update: false
+
+eval:
+  n_episodes: 20
+  deterministic: true
+  base_seed: 1000000
+
+early_stop:
+  enabled: false
+  consecutive: 2

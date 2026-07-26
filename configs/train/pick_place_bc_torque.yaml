@@ -1,0 +1,186 @@
+# Pick-and-place, torque control, warm-started from scripted demonstrations.
+#
+# The three-step pipeline (see scripts/record_demos.py and scripts/pretrain_bc.py
+# for the reasoning behind each):
+#
+#   1. python scripts/record_demos.py --config configs/train/pick_place_bc_torque.yaml \
+#          --episodes 60 --out demos/pick_place_torque.npz
+#   2. python scripts/pretrain_bc.py --config configs/train/pick_place_bc_torque.yaml \
+#          --demos demos/pick_place_torque.npz --out outputs/pick_place_bc_torque
+#   3. python scripts/train.py --config configs/train/pick_place_bc_torque.yaml \
+#          --resume outputs/pick_place_bc_torque
+#
+# This is the "keep torque control" option. It keeps the 8-D joint-torque action
+# space exactly as the aborted run had it, and changes *where the policy starts*
+# rather than what it controls.
+#
+# It is viable because torque labels are recoverable: apply_torque scales a
+# normalized action by JOINT_TORQUE_LIMITS and then adds gravity compensation, so
+# the action reproducing a desired pre-compensation torque tau is exactly
+# tau / JOINT_TORQUE_LIMITS. record_demos.py's TorqueExpert generates tau with an
+# inertia-shaped (computed-torque) law along IK waypoints, so the recorded labels
+# are the actions the policy must emit, not approximations of them. Measured:
+# 12/12 scripted attempts produce a full pick and place, mean 162 steps.
+#
+# One caveat to be explicit about, because it bounds what this option can achieve.
+# BC teaches the policy to imitate *that controller*. Everything the controller
+# reads -- joint positions and velocities, object and goal poses -- is in the
+# observation, so the mapping is learnable. But it is a mapping to a slow,
+# critically damped trajectory follower, and PPO then has to improve on it under a
+# reward whose penalties charge for exactly the joint speed the demonstrations use
+# sparingly. Expect BC to move the grasp rate off zero and PPO to do the rest;
+# expect it to be undone if ent_coef immediately widens sigma back toward 1.0,
+# which is what the narrowed policy block below is for.
+
+run_name: pick_place_bc_torque
+output_dir: outputs
+
+seed: 0
+device: cpu
+
+env:
+  task: pick_place
+  num_envs: 16
+  control_mode: torque
+  control_dt: 0.04
+  max_episode_steps: 250
+  reset_pose: ready_low
+  gravity_compensation: true
+  terminate_on_success: false
+  async_envs: false
+
+  # Level 1, not 2. With demonstrations supplying the grasp there is no longer a
+  # reason to hand the policy an already-grasped object; stage 1 (pre-grasp hover,
+  # jaw open) is the state worth practising and stage 0 is the task. Level 2 also
+  # works against BC directly: its seeded starts are off the demonstration
+  # distribution, so early rollouts would pull the policy away from the behaviour
+  # it was just initialized to.
+  curriculum_level: 1
+
+  # Load-bearing, and it must match what record_demos.py recorded under, since the
+  # demonstrations encode gripper actions whose effect depends on it. It is also
+  # what makes the scripted grasp possible at all: without it, an action step from
+  # +1 to -1 drives the jaw 0.080 -> 0.005 m inside one 40 ms control interval
+  # (~1.9 m/s), and that ejects a resting cube rather than gripping it -- both pads
+  # report contact while the width passes straight through the 0.02-0.052 m band
+  # is_grasped requires. The torque expert scored 0/60 before this key existed and
+  # 12/12 after; nothing else about it changed.
+  gripper_rate_limit: 0.01
+
+  reward:
+    # The original torque-control values. Unlike the velocity and task-space
+    # configs, action_penalty is meaningful here: under torque control the action
+    # *is* an effort, so penalizing its square penalizes effort.
+    action_penalty: 0.005
+    velocity_penalty: 0.005
+
+normalize_obs:
+  enabled: true
+  clip: 10.0
+  # pretrain_bc.py fits these statistics on the demonstration set and writes
+  # checkpoints/obs_normalizer.npz beside the BC checkpoint; --resume loads it. If
+  # that file goes missing, train.py warns and the resumed policy sees inputs on a
+  # different scale than it was cloned on -- which presents as BC having
+  # accomplished nothing rather than as an error.
+
+policy:
+  hidden_sizes: [256, 256]
+  activation: tanh
+  shared_torso: false
+
+  # ln(0.3) = -1.204, narrower than the -0.5 the aborted run used. A cloned policy
+  # is only useful if the noise added on top of it does not swamp it: at sigma 0.61
+  # the sampled torque is dominated by exploration and the cloned mean stops being
+  # what actually executes.
+  log_std_init: -1.204
+
+  state_dependent_std: false
+  squash: false
+
+  # Tighter than the 1.0 of the from-scratch configs. The point of the clone is a
+  # narrow, structured policy, and a ceiling permitting sigma 1.0 permits the
+  # entropy bonus to walk it back to the regime the aborted run collapsed in.
+  action_std_ceiling: 0.5
+
+anneal:
+  enabled: true
+  rebase_on_resume: false
+
+  # An order of magnitude below the 0.01 of the from-scratch configs. Entropy is
+  # bought to escape a state with no gradient; after BC there is gradient, and the
+  # same bonus now mostly widens sigma away from the cloned mean.
+  ent_coef:
+    start: 0.001
+    end: 0.0001
+
+  penalties:
+    action_penalty:
+      start: 0.005
+      end: 0.015
+      ramp_start: 0.5
+    velocity_penalty:
+      start: 0.005
+      end: 0.015
+      ramp_start: 0.5
+
+ppo:
+  total_timesteps: 10000000
+  num_steps: 256
+  num_minibatches: 32
+  update_epochs: 10
+
+  # 1e-4, not 3e-4. The first updates after a resume act on a policy that already
+  # encodes a solution, against a value function that has only ever seen the
+  # demonstration distribution. A large step there is how a warm start gets spent
+  # instead of used.
+  learning_rate: 1.0e-4
+
+  anneal_lr: true
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  clip_vloss: true
+  ent_coef: 0.001
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  target_kl: 0.02
+  normalize_advantage: true
+
+  success_threshold: 0.75
+  success_window: 100
+
+  eval_interval: 20
+  checkpoint_interval: 50
+  log_interval: 10
+
+  # Must stay false with the bc block below active: the auxiliary term draws a
+  # fresh demonstration minibatch every update, so the fused loss would recompile.
+  compile_update: false
+
+# Auxiliary behavioural-cloning term inside the PPO update (DAPG-style). Read by
+# scripts/train.py; omitted or disabled leaves the trainer exactly as it was.
+#
+# Pre-training alone is fragile: nothing in the PPO objective preserves the cloned
+# behaviour, and the iterations where it is least protected are the first ones,
+# where the advantage estimates are worst. A decaying likelihood term on the
+# demonstrations anchors the policy while the value function catches up.
+bc:
+  enabled: true
+  demos: demos/pick_place_torque.npz
+
+  # Coefficient on the demonstration negative log-likelihood, decayed
+  # geometrically per iteration. At a policy loss of order 0.01-0.1 a coefficient
+  # of 0.1 makes the term comparable early and negligible later:
+  # 0.999^1000 = 0.37, 0.999^2400 = 0.09 over this budget's ~2441 iterations.
+  coef: 0.1
+  decay: 0.999
+  batch_size: 256
+
+eval:
+  n_episodes: 20
+  deterministic: true
+  base_seed: 1000000
+
+early_stop:
+  enabled: false
+  consecutive: 2

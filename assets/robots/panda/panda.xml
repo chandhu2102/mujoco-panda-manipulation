@@ -1,0 +1,173 @@
+<mujoco model="panda">
+  <!--
+    Franka Emika Panda, 7-DoF arm + parallel-jaw hand.
+
+    Kinematics (link offsets and joint axes) follow the official Franka
+    parameters, so forward kinematics match the real arm. Collision geometry is
+    coarse primitives, not the Franka meshes: assets/meshes/ is empty in this
+    repo, so there are no STLs to reference. Link masses are the official
+    values; rotational inertias are diagonal approximations. That combination is
+    fine for RL development and wrong for contact-rich sim-to-real dynamics --
+    swap in mujoco_menagerie's panda.xml before making transfer claims.
+
+    Contact bitmask scheme (contype/conaffinity), so the arm cannot spuriously
+    collide with itself while still colliding with the world:
+      arm + fingers : contype=1 conaffinity=2
+      static scene  : contype=2 conaffinity=2
+      manipulands   : contype=2 conaffinity=3
+    Pairs collide iff (contype_a & conaffinity_b) || (contype_b & conaffinity_a):
+      arm/arm    -> (1&2)|(1&2) = 0   no self-collision
+      arm/table  -> (1&2)|(2&2) = 2   collide
+      arm/object -> (1&3)|(2&2) = 3   collide
+      table/obj  -> (2&2)|(2&3) = 2   collide  (object rests on table)
+  -->
+
+  <compiler angle="radian" autolimits="true"/>
+
+  <default>
+    <default class="panda">
+      <joint axis="0 0 1" damping="5" armature="0.1" frictionloss="0.2"/>
+      <geom type="capsule" contype="1" conaffinity="2" condim="4"
+            friction="1 0.05 0.01" rgba="0.87 0.89 0.91 1" density="0"/>
+      <motor gear="1" ctrllimited="true"/>
+
+      <default class="panda_finger">
+        <joint type="slide" axis="0 1 0" range="0 0.04" damping="30"
+               armature="0.01" frictionloss="1.0"/>
+        <!-- High tangential friction: primitive box pads have far less real
+             contact area than the rubberized Franka pads, so grasps slip
+             without it. -->
+        <geom type="box" condim="4" friction="2.0 0.2 0.01"
+              rgba="0.15 0.15 0.17 1" density="0"/>
+      </default>
+    </default>
+  </default>
+
+  <worldbody>
+    <body name="link0" pos="0 0 0" childclass="panda">
+      <inertial pos="-0.041 0 0.05" mass="2.92"
+                diaginertia="0.0075 0.0100 0.0090"/>
+      <geom name="link0_geom" fromto="0 0 0.02 0 0 0.16" size="0.07"/>
+
+      <body name="link1" pos="0 0 0.333">
+        <inertial pos="0.0039 0.0021 -0.0476" mass="2.74"
+                  diaginertia="0.0180 0.0180 0.0090"/>
+        <joint name="joint1" range="-2.8973 2.8973"/>
+        <geom name="link1_geom" fromto="0 0 -0.19 0 0 -0.03" size="0.06"/>
+
+        <body name="link2" quat="1 -1 0 0">
+          <inertial pos="-0.0031 -0.0287 0.0035" mass="2.74"
+                    diaginertia="0.0180 0.0090 0.0180"/>
+          <joint name="joint2" range="-1.7628 1.7628"/>
+          <geom name="link2_geom" fromto="0 0 0 0 -0.26 0" size="0.06"/>
+
+          <body name="link3" pos="0 -0.316 0" quat="1 1 0 0">
+            <inertial pos="0.0275 0.0393 -0.0665" mass="2.38"
+                      diaginertia="0.0090 0.0090 0.0090"/>
+            <joint name="joint3" range="-2.8973 2.8973"/>
+            <geom name="link3_geom" fromto="0 0 -0.14 0 0 -0.02" size="0.055"/>
+
+            <body name="link4" pos="0.0825 0 0" quat="1 1 0 0">
+              <inertial pos="-0.0532 0.1044 0.0275" mass="2.38"
+                        diaginertia="0.0090 0.0090 0.0090"/>
+              <joint name="joint4" range="-3.0718 -0.0698"/>
+              <geom name="link4_geom" fromto="0 0 0 -0.083 0.21 0" size="0.055"/>
+
+              <body name="link5" pos="-0.0825 0.384 0" quat="1 -1 0 0">
+                <inertial pos="-0.0120 0.0411 -0.0384" mass="2.74"
+                          diaginertia="0.0290 0.0290 0.0060"/>
+                <joint name="joint5" range="-2.8973 2.8973"/>
+                <geom name="link5_geom" fromto="0 0 -0.26 0 0 -0.10" size="0.05"/>
+
+                <body name="link6" quat="1 1 0 0">
+                  <inertial pos="0.0601 -0.0141 -0.0105" mass="1.55"
+                            diaginertia="0.0030 0.0030 0.0030"/>
+                  <joint name="joint6" range="-0.0175 3.7525"/>
+                  <geom name="link6_geom" fromto="0 0 -0.01 0.075 0 -0.01" size="0.05"/>
+
+                  <body name="link7" pos="0.088 0 0" quat="1 1 0 0">
+                    <inertial pos="0.0105 -0.0043 0.0616" mass="0.54"
+                              diaginertia="0.0008 0.0008 0.0008"/>
+                    <joint name="joint7" range="-2.8973 2.8973"/>
+                    <geom name="link7_geom" fromto="0 0 0.01 0 0 0.06" size="0.045"/>
+
+                    <!-- Flange -> hand: 0.107 m along z, rotated -45 deg about z. -->
+                    <body name="hand" pos="0 0 0.107" quat="0.9238795 0 0 -0.3826834">
+                      <inertial pos="-0.01 0 0.03" mass="0.73"
+                                diaginertia="0.0018 0.0025 0.0017"/>
+                      <geom name="hand_geom" type="box" size="0.03 0.05 0.025"
+                            pos="0 0 0.03"/>
+
+                      <!-- Tool centre point: midway between the finger pads at
+                           the closed width. All reward distances use this. -->
+                      <site name="eef_site" pos="0 0 0.1034" size="0.008"
+                            rgba="1 0.3 0.1 0.6" group="1"/>
+                      <site name="hand_site" pos="0 0 0.03" size="0.006"
+                            rgba="0.2 0.6 1 0.4" group="1"/>
+
+                      <!--
+                        Eye-in-hand camera for pixel observations. +z of the hand
+                        frame is the approach axis (fingers sit at z=0.0584, TCP
+                        at z=0.1034), and a MuJoCo camera looks down its own -z,
+                        so the camera frame needs z = -approach. With
+                        x = (0,-1,0) and y = (-0.970,0,-0.243), the cross product
+                        x*y = (0.243,0,-0.970) tilts the view ~14 deg inward off
+                        the approach axis. Offset to x=0.05 so the hand box
+                        (half-extent 0.03) does not occlude the lens.
+                      -->
+                      <camera name="wristview" pos="0.05 0 0.02"
+                              xyaxes="0 -1 0 -0.970 0 -0.243" fovy="75"/>
+
+                      <body name="left_finger" pos="0 0 0.0584" childclass="panda_finger">
+                        <inertial pos="0 0.0145 0.0227" mass="0.015"
+                                  diaginertia="2.4e-6 2.4e-6 2.4e-6"/>
+                        <joint name="finger_joint1"/>
+                        <geom name="left_finger_geom" size="0.010 0.008 0.022"
+                              pos="0 0.0085 0.023"/>
+                        <site name="left_finger_tip" pos="0 0.0085 0.045"
+                              size="0.005" rgba="0.1 1 0.3 0.5" group="1"/>
+                      </body>
+
+                      <body name="right_finger" pos="0 0 0.0584" childclass="panda_finger">
+                        <inertial pos="0 -0.0145 0.0227" mass="0.015"
+                                  diaginertia="2.4e-6 2.4e-6 2.4e-6"/>
+                        <joint name="finger_joint2" axis="0 -1 0"/>
+                        <geom name="right_finger_geom" size="0.010 0.008 0.022"
+                              pos="0 -0.0085 0.023"/>
+                        <site name="right_finger_tip" pos="0 -0.0085 0.045"
+                              size="0.005" rgba="0.1 1 0.3 0.5" group="1"/>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <!--
+      Arm: direct torque motors, ctrlrange = the official Franka torque limits.
+      Velocity control is layered on top in Python (PandaRobot.apply_velocity)
+      as a joint-space P law rather than a second MuJoCo actuator set, so the
+      model has exactly one actuator per DoF and the two control modes cannot
+      fight each other.
+    -->
+    <motor class="panda" name="actuator1" joint="joint1" ctrlrange="-87 87"/>
+    <motor class="panda" name="actuator2" joint="joint2" ctrlrange="-87 87"/>
+    <motor class="panda" name="actuator3" joint="joint3" ctrlrange="-87 87"/>
+    <motor class="panda" name="actuator4" joint="joint4" ctrlrange="-87 87"/>
+    <motor class="panda" name="actuator5" joint="joint5" ctrlrange="-12 12"/>
+    <motor class="panda" name="actuator6" joint="joint6" ctrlrange="-12 12"/>
+    <motor class="panda" name="actuator7" joint="joint7" ctrlrange="-12 12"/>
+
+    <!-- Fingers are position-servoed; the policy commands one shared width. -->
+    <position name="actuator_finger1" joint="finger_joint1" ctrlrange="0 0.04"
+              kp="3000" forcerange="-100 100"/>
+    <position name="actuator_finger2" joint="finger_joint2" ctrlrange="0 0.04"
+              kp="3000" forcerange="-100 100"/>
+  </actuator>
+</mujoco>

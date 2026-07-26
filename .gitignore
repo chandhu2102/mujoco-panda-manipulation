@@ -1,0 +1,17 @@
+# Python Caches
+__pycache__/
+*.pyc
+.claude/
+sweep_holdout.py
+
+# Heavy Training Outputs and Binary Checkpoints
+outputs/
+demos/
+*.log
+*.jsonl
+*.pt
+*.npz
+*.mp4
+
+# macOS Metadata files
+.DS_Store

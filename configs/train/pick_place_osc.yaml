@@ -1,0 +1,197 @@
+# Pick-and-place under task-space (delta-position) control.
+#
+#   python scripts/train.py --config configs/train/pick_place_osc.yaml --smoke
+#   python scripts/train.py --config configs/train/pick_place_osc.yaml
+#
+# The pivot away from configs/train/pick_place_10m.yaml, whose 10M-step run was
+# aborted at 1.72M with true_success and eval_success both pinned at 0.0% and the
+# unassisted grasp rate stalled at 3-6%. What changed is not a hyperparameter:
+# the policy no longer outputs joint torques. It outputs a 4-D tool-centre-point
+# delta, which envs/wrappers/task_space.py resolves into joint angles with IK and
+# a 500 Hz PD servo tracks.
+#
+# Why that is expected to matter, in one line each:
+#   * "hold still" is the single action 0, not a state-dependent torque.
+#   * exploration noise is a bounded displacement in metres, not a doubly
+#     integrated random walk.
+#   * the servo has positional stiffness, so pad reaction forces during closure
+#     deflect the tool centre point instead of accelerating it away.
+#
+# Measured with a scripted expert on this exact wrapper stack: 5/5 episodes
+# reached is_grasped with a jaw width of 0.0343-0.0349 m, comfortably inside the
+# 0.02-0.052 m band the predicate accepts. The grasp is reachable by an open-loop
+# script here, which is the property torque control did not have.
+
+run_name: pick_place_osc
+output_dir: outputs
+
+seed: 0
+device: cpu
+
+env:
+  task: pick_place
+  num_envs: 16
+
+  # Required by TaskSpaceWrapper: the IK emits a joint *angle* target, so the arm
+  # half of the inner action space has to be interpreted as one.
+  control_mode: joint_position
+  control_dt: 0.04
+  max_episode_steps: 250
+  reset_pose: ready_low
+  gravity_compensation: true      # not optional under joint_position; the env
+                                  # rejects False (standing droop of qfrc_bias/kp)
+  terminate_on_success: false
+  async_envs: false
+
+  # Start at level 1 rather than 2. Level 2+ hands the policy an already-grasped
+  # object, which was the right trade when the grasp was undiscoverable; now that
+  # a scripted grasp works, stage 1 (pre-grasp hover, jaw open) is the state the
+  # policy should be practising from and stage 0 is the task. Raise to 2 only if
+  # the lift/place stages turn out to be the blocker.
+  curriculum_level: 1
+
+  task_space:
+    enabled: true
+
+    # 0.012 m at |action| = 1, i.e. 0.30 m/s at the 25 Hz control rate.
+    max_delta_pos: 0.012
+
+    # This is also why env.gripper_rate_limit is absent from this config: the
+    # wrapper integrates the jaw command itself, so the closure is already spread
+    # over 8 steps (0.25 m/s) and the env-level limit would be redundant. Setting
+    # both is harmless but the tighter of the two wins, which makes the effective
+    # rate non-obvious from either line alone.
+    max_delta_width: 0.010
+
+    # Inside the region reach.py verified IK-reachable and collision-free.
+    workspace_low: [0.30, -0.28, 0.42]
+    workspace_high: [0.68, 0.28, 0.75]
+
+    # Target lead allowance. Must exceed the servo's steady-state tracking lag
+    # (~speed/omega_n = 0.30/25 = 1.2 cm) or it caps the reachable tool speed.
+    leash: 0.05
+
+    # The jaw axis follows the object's nearest square face. This keeps the action
+    # space at 4-D and keeps the grasp geometrically possible at all: is_grasped
+    # accepts a jaw width up to 0.052 m, a 4 cm cube on its diagonal measures
+    # 0.057 m, and PICK_PLACE_RANDOMIZATION yaws the cube +-45 degrees -- so a
+    # fixed jaw cannot grasp near the ends of that range whatever the policy does.
+    #
+    # Be clear about what this costs: the controller reads the object's pose, so
+    # wrist alignment is solved *for* the policy. Set to "action" for a 5-D space
+    # that keeps the alignment in the policy, or "fixed" plus a narrowed
+    # env.reward-adjacent object_yaw range if you want the 4-D space without the
+    # privileged read.
+    wrist_yaw: track_object
+
+    # Null-space pull toward the reset pose inside the IK. Not cosmetic: at 0.0 a
+    # scripted descent reached joint1 = 2.1 rad with link4_geom contacting
+    # table_top, and the tool centre point stalled 2.6 cm short with the elbow
+    # pinned. See solve_site_ik.
+    posture_gain: 0.15
+
+    effort_penalty: 0.01
+
+  reward:
+    # MUST be 0 under joint_position control, and TaskSpaceWrapper raises if it is
+    # not. compute_reward is handed the *inner* action, which here is a vector of
+    # normalized joint angles -- so action_penalty * sum(action^2) is a penalty on
+    # the arm's pose, pulling hardest toward the middle of every joint range,
+    # which is exactly where a top-down grasp is not. The task-space effort
+    # penalty above replaces it.
+    action_penalty: 0.0
+    velocity_penalty: 0.005
+
+normalize_obs:
+  enabled: true
+  clip: 10.0
+
+policy:
+  hidden_sizes: [256, 256]
+  activation: tanh
+  shared_torso: false
+  log_std_init: -0.5       # sigma ~= 0.61
+  state_dependent_std: false
+  squash: false
+
+  # Kept from pick_place_10m.yaml. Still worth having -- the runaway it guards
+  # against is a property of the entropy bonus and an uninformative advantage, not
+  # of torque control -- but it should bind much less often here: sigma = 1.0 in
+  # this action space is a 1.2 cm displacement command, which is a legitimate
+  # exploration scale rather than bang-bang torque.
+  action_std_ceiling: 1.0
+
+anneal:
+  enabled: true
+  rebase_on_resume: false
+
+  ent_coef:
+    start: 0.01
+    end: 0.001
+
+  # NOTE the deliberate absence of an action_penalty entry. The annealer calls
+  # set_reward_weights, so listing it here would write a non-zero action_penalty
+  # back into the envs one iteration into the run -- past TaskSpaceWrapper's
+  # construction-time check -- and silently reinstate the joint-pose prior the
+  # reward block above removes. Effort is penalized by task_space.effort_penalty,
+  # which is not on a schedule.
+  penalties:
+    velocity_penalty:
+      start: 0.005
+      end: 0.015
+      ramp_start: 0.5
+
+ppo:
+  total_timesteps: 10000000
+  num_steps: 256
+  num_minibatches: 32
+  update_epochs: 10
+  learning_rate: 3.0e-4
+  anneal_lr: true
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  clip_vloss: true
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  target_kl: 0.02
+  normalize_advantage: true
+
+  success_threshold: 0.75
+  success_window: 100
+
+  eval_interval: 20
+  checkpoint_interval: 50
+  log_interval: 10
+  compile_update: false
+
+# Optional: the two pivots compose, and this is the combination to reach for if
+# task-space PPO alone is still slow to find the grasp. Demonstrations are already
+# recorded for this exact wrapper stack (40/42 scripted attempts kept, mean 100
+# steps), so all that is needed is to uncomment this and run the pretrain step:
+#
+#   python scripts/pretrain_bc.py --config configs/train/pick_place_osc.yaml \
+#       --demos demos/pick_place_osc.npz --out outputs/pick_place_osc_bc
+#   python scripts/train.py --config configs/train/pick_place_osc.yaml \
+#       --resume outputs/pick_place_osc_bc
+#
+# If enabled, narrow policy.log_std_init and policy.action_std_ceiling as
+# configs/train/pick_place_bc_torque.yaml does, and drop anneal.ent_coef with them
+# -- a clone at sigma 0.61 under an entropy bonus of 0.01 does not stay a clone.
+#
+# bc:
+#   enabled: true
+#   demos: demos/pick_place_osc.npz
+#   coef: 0.1
+#   decay: 0.999
+#   batch_size: 256
+
+eval:
+  n_episodes: 20
+  deterministic: true
+  base_seed: 1000000
+
+early_stop:
+  enabled: false
+  consecutive: 2

@@ -1,0 +1,81 @@
+# Reach task, 1.5M environment steps.
+#
+# Any key here can be overridden on the command line, e.g.
+#   python scripts/train.py --config configs/train/reach.yaml --set ppo.learning_rate=1e-4
+#
+# Budget arithmetic: num_envs * ppo.num_steps = 16 * 256 = 4096 steps per
+# iteration, so 1.5M steps is ~366 iterations. batch_size must be divisible by
+# ppo.num_minibatches (4096 / 32 = 128) or the ragged final minibatch forces a
+# torch.compile recompilation.
+
+run_name: reach_1p5m
+output_dir: outputs
+
+seed: 0
+
+# cpu, not auto. Measured on this machine: 2314 sps on cpu vs 1363 on mps, i.e.
+# `auto` would pick the 1.7x slower device. For a ~150k-parameter MLP on 128-row
+# minibatches, per-kernel launch overhead dominates and the accelerator loses;
+# MuJoCo stepping is CPU-bound regardless. Revisit for a CNN torso on pixels,
+# where the arithmetic is heavy enough to pay for the transfers.
+device: cpu
+
+env:
+  task: reach              # reach | manipulation
+  num_envs: 16
+  control_mode: torque     # torque | velocity
+  control_dt: 0.04
+  max_episode_steps: 150
+  reset_pose: home
+  gravity_compensation: true
+
+  # Must stay false with a per-step dense reward. Terminating on success forfeits
+  # the rest of the shaping term, which made hovering just outside the threshold
+  # worth 5x an actual success -- a run with this set to true drove deterministic
+  # eval success from 45% to 0% while the shaped return kept rising.
+  terminate_on_success: false
+  async_envs: false        # true uses subprocesses; see scripts/train.py
+
+normalize_obs:
+  enabled: true
+  clip: 10.0
+
+policy:
+  hidden_sizes: [256, 256]
+  activation: tanh         # tanh | relu | elu
+  shared_torso: false
+  log_std_init: -0.5
+  state_dependent_std: false
+  squash: false
+
+ppo:
+  total_timesteps: 1500000
+  num_steps: 256
+  num_minibatches: 32
+  update_epochs: 10
+  learning_rate: 3.0e-4
+  anneal_lr: true
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  clip_vloss: true
+  ent_coef: 0.0
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  target_kl: 0.02
+  normalize_advantage: true
+  success_threshold: 0.85
+  success_window: 100
+  eval_interval: 20        # ~every 82k steps at this batch size
+  checkpoint_interval: 50
+  log_interval: 10
+  compile_update: false    # see scripts/train.py --compile
+
+eval:
+  n_episodes: 20
+  deterministic: true
+  base_seed: 1000000
+
+early_stop:
+  enabled: false           # run the full budget by default
+  consecutive: 2

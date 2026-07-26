@@ -1,0 +1,146 @@
+# Pick-and-place task, 3M environment steps.
+#
+#   python scripts/train.py --config configs/train/pick_place.yaml
+#   python scripts/train.py --config configs/train/pick_place.yaml --smoke
+#   python scripts/train.py --config configs/train/pick_place.yaml --set ppo.ent_coef=0.0
+#
+# Budget arithmetic: num_envs * ppo.num_steps = 16 * 256 = 4096 steps per
+# iteration, so 3M steps is ~732 iterations. 4096 / 32 minibatches = 128 rows
+# each, and batch_size must stay divisible by ppo.num_minibatches or the ragged
+# final minibatch forces a torch.compile recompilation.
+#
+# 2x the reach budget for a task with a strictly longer credit chain: reach has
+# useful gradient on step one, whereas nothing past stage one of this reward
+# exists until exploration finds a grasp.
+
+run_name: pick_place_3m
+output_dir: outputs
+
+seed: 0
+
+# cpu, not auto -- same measurement as reach.yaml (2314 sps cpu vs 1363 mps).
+# For a ~150k-parameter MLP on 128-row minibatches, kernel launch overhead
+# dominates and the accelerator loses; MuJoCo stepping is CPU-bound regardless.
+device: cpu
+
+env:
+  task: pick_place         # reach | pick_place | manipulation
+  num_envs: 16
+  control_mode: torque     # torque | velocity
+  control_dt: 0.04
+
+  # 250 steps = 10 s at control_dt. The full reach -> grasp -> lift -> carry
+  # chain needs well over reach's 150, and an episode that truncates mid-carry
+  # teaches the value function that transport does not pay.
+  max_episode_steps: 250
+
+  # Pre-grasp hover: TCP ~15 cm above the cube spawn region, IK-solved (see
+  # RESET_POSES). Starting from `home` spends most of the episode on the reach
+  # stage that reach.yaml already validated.
+  reset_pose: ready_low
+
+  gravity_compensation: true
+
+  # Must stay false with a per-step dense reward. Terminating on success forfeits
+  # the rest of the shaping term, which made hovering just outside the threshold
+  # worth 5x an actual success -- a reach run with this set to true drove
+  # deterministic eval success from 45% to 0% while the shaped return kept rising.
+  terminate_on_success: false
+  async_envs: false        # true uses subprocesses; see scripts/train.py
+
+  # Start-state (reverse) curriculum. This is the *highest* stage an episode may
+  # seed; the stage actually used is drawn uniformly per reset, so level 2 mixes
+  # stages 0, 1 and 2. Per _CURRICULUM_STAGE_SPECS:
+  #
+  #   1  pre_grasp        jaw open, hovering 3 cm above the cube. Removes the
+  #                       reach, but the grasp is still to be discovered.
+  #   2  grasped_on_table already gripping the cube where it spawned. This is the
+  #                       first level that makes lift and place reachable without
+  #                       discovering a grasp -- level 1 alone does not.
+  #   3  grasped_at_goal  already gripping, 7.5 cm from the goal.
+  #
+  # Needed because is_grasped is a strict conjunction (contact + width band +
+  # enclosure) that torque-space exploration does not satisfy by chance: the 3M
+  # run at level 0 held a 0.0% grasp rate start to finish, so reward/grasp,
+  # reward/lift and reward/place were all identically zero for the whole budget
+  # and the run collected its entire return from reward/reach. Measured seeding
+  # rate is 77.5% of resets at level 1 and 77.5% at level 2 (0% rollback over 80
+  # resets each), the rest starting at stage 0 by design.
+  #
+  # Train at 2, then anneal to 0 -- there is no automatic schedule yet, so that is
+  # currently two runs (or a callback that writes env.curriculum_level). Watch
+  # rollout/true_unassisted_grasp_rate: it is the stage-0-only grasp rate, so it
+  # measures what the policy can do rather than what the curriculum handed it.
+  curriculum_level: 0
+
+  # Reward weights, applied over PickPlaceRewardConfig's defaults by field name.
+  # Only the keys listed here are overridable via --set (it validates against
+  # this tree), and any field omitted keeps the dataclass default -- so this block
+  # is the set of weights this run intends to *tune*, not a copy of all of them.
+  # Values below are the current PickPlaceRewardConfig defaults, i.e. listing them
+  # changes nothing on its own.
+  reward:
+    action_penalty: 0.005
+    velocity_penalty: 0.005
+
+normalize_obs:
+  enabled: true
+  clip: 10.0
+
+policy:
+  hidden_sizes: [256, 256]
+  activation: tanh         # tanh | relu | elu
+  shared_torso: false
+  log_std_init: -0.5
+  state_dependent_std: false
+  squash: false
+
+ppo:
+  total_timesteps: 3000000
+  num_steps: 256
+  num_minibatches: 32
+  update_epochs: 10
+  learning_rate: 3.0e-4
+  anneal_lr: true
+
+  # 0.995, not reach's 0.99. gamma=0.99 gives a ~100-step effective horizon
+  # against a 250-step episode, so at the moment of grasp the place reward
+  # ~150 steps out is discounted to ~0.22 and the grasp looks barely worth its
+  # exploration cost. 0.995 gives ~200 steps of lookahead, which covers the
+  # chain. Revert to 0.99 if value loss becomes unstable.
+  gamma: 0.995
+
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  clip_vloss: true
+
+  # Nonzero, unlike reach. The grasp stage is a discovery problem -- the reward
+  # past stage one is unreachable until the jaw happens to close on the cube --
+  # and a policy whose log_std has already annealed cannot find it. Small enough
+  # not to stop the place stage converging to 4 cm precision.
+  ent_coef: 0.005
+
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  target_kl: 0.02
+  normalize_advantage: true
+
+  # Early-stop bar, below reach's 0.85: a 4 cm placement tolerance with a
+  # randomized object *and* goal is a materially harder ask. early_stop.enabled
+  # is false anyway, so this only gates on_threshold_reached.
+  success_threshold: 0.75
+  success_window: 100
+
+  eval_interval: 20        # ~every 82k steps at this batch size, so ~36 evals
+  checkpoint_interval: 50
+  log_interval: 10
+  compile_update: false    # see scripts/train.py --compile
+
+eval:
+  n_episodes: 20
+  deterministic: true
+  base_seed: 1000000
+
+early_stop:
+  enabled: false           # run the full budget by default
+  consecutive: 2

@@ -1,0 +1,175 @@
+# Pick-and-place, 10M environment steps, curriculum level 2, annealed
+# entropy and annealed action/velocity penalties.
+#
+#   python scripts/train.py --config configs/train/pick_place_10m.yaml
+#   python scripts/train.py --config configs/train/pick_place_10m.yaml --smoke
+#   python scripts/train.py --config configs/train/pick_place_10m.yaml \
+#       --set anneal.ent_coef.start=0.006
+#
+# Why this exists as its own file rather than as --set flags over pick_place.yaml:
+# the previous 3M -> 6.4M attempt was configured entirely on the command line
+# (curriculum_level=2, ent_coef=0.002, penalties=0.015), which is why nothing on
+# disk records what it actually ran, and why its metrics.jsonl now holds four
+# interleaved series under one run_name. A config file is the reproducible unit.
+#
+# Budget arithmetic: num_envs * ppo.num_steps = 16 * 256 = 4096 steps per
+# iteration, so 10M steps is ~2441 iterations. 4096 / 32 minibatches = 128 rows
+# each; batch_size must stay divisible by ppo.num_minibatches or the ragged final
+# minibatch forces a torch.compile recompilation.
+
+run_name: pick_place_10m
+output_dir: outputs
+
+seed: 0
+
+# cpu, not auto -- measured 2314 sps cpu vs 1363 mps for a ~150k-parameter MLP on
+# 128-row minibatches: kernel launch overhead dominates and the accelerator
+# loses, and MuJoCo stepping is CPU-bound regardless.
+device: cpu
+
+env:
+  task: pick_place
+  num_envs: 16
+  control_mode: torque
+  control_dt: 0.04
+  max_episode_steps: 250
+  reset_pose: ready_low
+  gravity_compensation: true
+  terminate_on_success: false
+  async_envs: false
+
+  # The highest stage an episode may seed; the stage used is drawn uniformly per
+  # reset, so level 2 mixes stages 0, 1 and 2. Level 2 is the first level that
+  # makes lift and place reachable without discovering a grasp. Seeding
+  # probability decays 0.80 -> 0.05 over the run (CURRICULUM_PROB_*), driven by
+  # CurriculumSchedule, and eval always runs at level 0.
+  #
+  # Watch rollout/true_unassisted_grasp_rate: it is the stage-0-only grasp rate,
+  # so it measures what the policy can do rather than what it was handed.
+  curriculum_level: 2
+
+  # Baselines, not endpoints. `anneal.penalties` below rewrites both of these
+  # every iteration once training passes anneal.penalties.*.ramp_start; the values
+  # here are what the schedule starts from, and what the *evaluator's* env keeps
+  # for the whole run (it is constructed separately and holds its own reward
+  # config, so eval/episode_return stays on a fixed yardstick while the training
+  # penalties move).
+  reward:
+    action_penalty: 0.005
+    velocity_penalty: 0.005
+
+normalize_obs:
+  enabled: true
+  clip: 10.0
+
+policy:
+  hidden_sizes: [256, 256]
+  activation: tanh
+  shared_torso: false
+  log_std_init: -0.5       # sigma ~= 0.61
+  state_dependent_std: false
+  squash: false
+
+  # Ceiling on per-joint action sigma, clamped after every optimizer step.
+  #
+  # This is the guard for what actually ended the 6.4M run. With ent_coef > 0 and
+  # no advantage signal past the reach stage, the entropy bonus is the only
+  # consistent gradient on log_std and Adam walks it upward unopposed: measured
+  # entropy rose monotonically 10.5 -> 14.6 nats (sigma ~0.78 -> ~1.5, three
+  # joints past 2.0) while return fell 213 -> 94 and the unassisted grasp rate
+  # decayed 0.086 -> 0.008. At that sigma the sampled torques are near-uniform
+  # over the action range, which drowns the fine positioning is_grasped needs and
+  # rings up the very penalties this config anneals.
+  #
+  # 1.0 sits above log_std_init (0.61) and above the widest sigma the run reached
+  # while its grasp rate was still improving (~0.9 at 3.4M), so it bounds the
+  # runaway without narrowing useful exploration. Remove the key to log
+  # train/action_std_* without clamping.
+  action_std_ceiling: 1.0
+
+# Entropy and penalty annealing, both linear in progress = global_step /
+# ppo.total_timesteps. See EntropyPenaltySchedule for the timing: ent_coef is
+# exact for the update that follows each rollout, penalties land one iteration
+# later because they are applied inside the envs.
+anneal:
+  enabled: true
+
+  # False keeps progress on absolute steps, in phase with the curriculum's
+  # seeding probability. True instead maps [resume_step, total] -> [0, 1], which
+  # is what a *restart* of a collapsed policy wants (the full entropy schedule
+  # again) and what continuing a healthy run does not. Only meaningful with
+  # --resume.
+  rebase_on_resume: false
+
+  # High while the grasp is still a discovery problem, low to let the place stage
+  # converge to 4 cm precision. Note the interaction with action_std_ceiling
+  # above: the ceiling is what makes a start this high safe, since the entropy
+  # bonus can no longer ratchet sigma without bound.
+  ent_coef:
+    start: 0.01
+    end: 0.001
+
+  # Flat at the 0.005 baseline for the first half of the run -- charged full price
+  # before a reach-to-grasp trajectory exists, the cheapest way to stop paying is
+  # to stop moving, and holding still is a local optimum far easier to find than a
+  # grasp. From progress 0.50 they ramp to 0.015 to clean up torque chatter around
+  # a trajectory already worth keeping.
+  #
+  # For reference, seeding probability is 0.425 at progress 0.50 and crosses below
+  # 0.50 at progress 0.40 (0.80 - 0.75 * progress); set ramp_start: 0.4 to tie the
+  # ramp to that crossing instead.
+  penalties:
+    action_penalty:
+      start: 0.005
+      end: 0.015
+      ramp_start: 0.5
+    velocity_penalty:
+      start: 0.005
+      end: 0.015
+      ramp_start: 0.5
+
+ppo:
+  total_timesteps: 10000000
+  num_steps: 256
+  num_minibatches: 32
+  update_epochs: 10
+  learning_rate: 3.0e-4
+  anneal_lr: true
+
+  # 0.995, not 0.99: gamma=0.99 gives a ~100-step effective horizon against a
+  # 250-step episode, so at the moment of grasp the place reward ~150 steps out
+  # discounts to ~0.22 and the grasp looks barely worth its exploration cost.
+  # Revert to 0.99 if value loss becomes unstable.
+  gamma: 0.995
+
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  clip_vloss: true
+
+  # Starting value only -- anneal.ent_coef rewrites this every iteration. Kept
+  # equal to anneal.ent_coef.start so that disabling the annealer leaves a
+  # coherent fixed-coefficient run rather than silently reverting to some other
+  # number.
+  ent_coef: 0.01
+
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  target_kl: 0.02
+  normalize_advantage: true
+
+  success_threshold: 0.75
+  success_window: 100
+
+  eval_interval: 20        # ~every 82k steps, so ~122 evals over the budget
+  checkpoint_interval: 50
+  log_interval: 10
+  compile_update: false    # a live ent_coef recompiles the fused loss; see below
+
+eval:
+  n_episodes: 20
+  deterministic: true
+  base_seed: 1000000
+
+early_stop:
+  enabled: false
+  consecutive: 2
