@@ -1,0 +1,341 @@
+# Obstacle-avoidance pick-and-place under task-space (OSC) control, warm-started
+# from scripted obstacle-aware demonstrations with a DAPG-style auxiliary BC term.
+#
+#   1. python scripts/pretrain_bc.py --config configs/train/pick_place_obstacle.yaml \
+#          --demos demos/pick_place_obstacle_osc_400.npz \
+#          --out outputs/pick_place_obstacle
+#   2. python scripts/train.py --config configs/train/pick_place_obstacle.yaml \
+#          --resume outputs/pick_place_obstacle
+#
+# Relationship to the other configs. This is the same composition as
+# configs/train/pick_place_osc_bc.yaml -- the control stack that reached 100%
+# convergence on the baseline is held fixed, so what this run measures is the
+# barrier and nothing else -- pointed at a barrier-aware demonstration set and with
+# the collision charge live. The OSC block, the policy/entropy block and the PPO
+# block are therefore all inherited from that config rather than retuned; the two
+# deliberate departures (curriculum level, max_grad_norm rationale) are flagged
+# where they occur.
+#
+# What is new versus the baseline, in full:
+#
+#   * task: pick_place_obstacle -- same reward and staging as pick_place, with the
+#     object spawn box moved to the far side of the wall (x 0.56-0.61) and the goal
+#     box to the near side (x 0.37-0.43). See envs/tasks/obstacle_pick_place.py.
+#   * reward.collision_penalty -- charged per step while any arm or finger geom
+#     touches the barrier. Off (0.0) for every other task and config.
+#   * The wall itself lives in assets/panda_scene.xml as the geom named
+#     `obstacle`, spanning x 0.465-0.495, y +-0.25, with its top face at z 0.50.
+#     It is static, so it cannot be pushed aside.
+#   * bc.demos points at a re-recorded, barrier-aware demonstration set. The
+#     baseline's demos are not reusable here and are not safe to fall back to; see
+#     the bc block at the bottom.
+
+run_name: pick_place_obstacle
+output_dir: outputs                 # -> outputs/pick_place_obstacle
+
+seed: 0
+device: cpu
+
+env:
+  task: pick_place_obstacle
+  num_envs: 16
+
+  # --- OSC stack, unchanged from pick_place_osc_bc.yaml --------------------- #
+  # Required by TaskSpaceWrapper: the IK emits a joint *angle* target.
+  control_mode: joint_position
+  control_dt: 0.04
+  max_episode_steps: 250
+  reset_pose: ready_low
+  gravity_compensation: true      # not optional under joint_position
+  terminate_on_success: false
+  async_envs: false
+
+  task_space:
+    enabled: true
+    max_delta_pos: 0.012
+    max_delta_width: 0.010
+    workspace_low: [0.30, -0.28, 0.42]
+    workspace_high: [0.68, 0.28, 0.75]
+    leash: 0.05
+    wrist_yaw: track_object
+    posture_gain: 0.15
+    effort_penalty: 0.01
+  # ------------------------------------------------------------------------- #
+
+  # Level 0 -- NO start-state seeding. This is a deliberate departure from
+  # pick_place_osc_bc.yaml's level 1, and the one that decides whether this run
+  # works at all. Measured, deterministic, 60 episodes on the BC clone:
+  #
+  #   level 0 (honest starts)   82% success, 87% grasp, 5% touched the wall
+  #   level 1 (80% seeded)      43% success
+  #     ... split by start state: 7/9 on stage-0 starts, 19/51 on stage-1 seeds
+  #
+  # The clone is *worse* on the seeded states than on the honest task, which
+  # inverts the premise a reverse curriculum rests on. The reason is distribution
+  # shift, and it is specific to this task: a stage-1 seed teleports the arm to an
+  # IK-solved pre-grasp hover 3 cm over the cube with the jaw at half width, and
+  # the demonstrations contain no such state -- they arrive at the cube from the
+  # crossing altitude with the jaw wide open, because they had to clear a barrier
+  # to get there. On the obstacle-free baseline the seeded pose and the
+  # demonstrated approach look alike, so level 1 cost that run nothing. Here they
+  # do not.
+  #
+  # Left at level 1, PPO spends 80% of its rollouts on states the clone cannot
+  # handle, and the advantage signal duly walks the policy off the cloned
+  # behaviour: a 2441-iteration run reached iteration 560 at 3% success and 52%
+  # of episodes touching the wall, with rollout grasp reward flat at 0.0000 from
+  # iteration 150 on. Artifacts kept in
+  # outputs/pick_place_obstacle.curriculum1_failed.
+  #
+  # There is also nothing left for a curriculum to buy: it exists to make late
+  # stages reachable when exploration cannot find them, and an 82% clone has
+  # already found them. Raise this only if a future change breaks that.
+  #
+  # (The seeder is obstacle-aware regardless -- it prefers wrist yaws that clear
+  # the barrier and rejects seeded states touching it, at a 1.7% rejection rate on
+  # this geometry. That machinery is what makes level 1+ *safe* to use; it is not
+  # what makes it useful.)
+  curriculum_level: 0
+
+  reward:
+    # MUST be 0 under joint_position control; TaskSpaceWrapper raises otherwise.
+    action_penalty: 0.0
+    velocity_penalty: 0.005
+
+    # The new term. Flat per-step charge while the arm is in contact with the
+    # barrier -- see RewardConfig.collision_penalty for why it is flat rather than
+    # scaled by contact count or penetration depth.
+    #
+    # 5.0 against a full stage sum of ~19/step means one step of scraping costs
+    # more than the entire grasp-plus-lift stack. That is the intent, and it is
+    # also the number to suspect first if the run misbehaves: the object spawns
+    # 6.5 cm from the wall and the reach term pulling the gripper there is worth
+    # at most 1.0/step, so an over-large charge teaches avoidance of the workspace
+    # rather than of the wall. The symptom is reward/reach collapsing in the first
+    # few hundred iterations while rollout/dist/eef_to_object climbs. If that
+    # happens, do not simply lower it -- move it into the anneal.penalties block
+    # below and ramp 1.0 -> 5.0, so avoidance is learned on top of a reach the
+    # policy already has.
+    collision_penalty: 5.0
+
+normalize_obs:
+  enabled: true
+  clip: 10.0
+  # pretrain_bc.py fits these on the demonstration set and writes
+  # checkpoints/obs_normalizer.npz beside the BC checkpoint; --resume loads it.
+  # If that file goes missing train.py only warns, and the symptom is BC appearing
+  # to have accomplished nothing rather than an error.
+
+  # Freezing these for the whole run is available and was briefly used here. It is
+  # NOT needed once the DAPG anchor is fixed, and the distinction matters.
+  #
+  # The measurement that motivated it stands: one set of BC weights, 60
+  # deterministic stage-0 episodes, changing nothing but the normalizer --
+  # demo-fitted statistics gave 87% success, the same run's statistics 90
+  # iterations later gave 0%, with per-dimension sd ratios reaching 11.3x. But that
+  # drift is a *consequence*, not the cause: the anchor bug drove the policy into
+  # wild states, whose statistics then diverged. Freezing suppressed the amplifier
+  # while leaving the cause running, which is why the collapse continued anyway.
+  #
+  # Two hypotheses of mine that the data refuted, recorded so they are not retried:
+  # the drift is not caused by a degenerate demonstration set (this set's minimum
+  # per-dimension std is 1.27e-2 against the obstacle-free baseline's 1.15e-2, and
+  # nothing is within six orders of magnitude of RunningMeanStd.var_floor), and the
+  # lower holdout MSE here is not a symptom of a more stereotyped teacher (action
+  # variance is 0.584 against the baseline's 0.565, so normalized MSE 0.023 vs
+  # 0.053 means the clone genuinely fits better).
+  freeze: false
+
+policy:
+  hidden_sizes: [256, 256]
+  activation: tanh
+  shared_torso: false
+
+  # ln(0.1) = -2.303, an order of magnitude tighter than pick_place_osc_bc.yaml's
+  # ln(0.3). This task needs it, and the measurement is unambiguous -- BC clone
+  # success and wall-contact rate against the sigma its actions are sampled at,
+  # 60 deterministic-mean episodes per row, stage-0 starts:
+  #
+  #     sigma   success   grasp   touched wall
+  #      0.00      82%      87%       5%
+  #      0.05      83%      97%       5%
+  #      0.10      92%      95%       5%
+  #      0.20      68%      82%      15%
+  #      0.30      50%      57%      22%
+  #      0.50      37%      55%      37%
+  #
+  # At 0.3 half the rollouts fail and a fifth scrape the barrier, so PPO's
+  # advantage signal is dominated by failures the *noise* caused and the -5.0
+  # collision charges are credited to the policy that did not cause them. A
+  # 2441-iteration run configured that way fell from an 82% clone to 2% success by
+  # iteration 30, twice, with and without curriculum seeding.
+  #
+  # Why this task and not the baseline: max_delta_pos is 0.012 m, so sigma 0.3
+  # injects ~3.6 mm per axis per step. Over ~130 steps that is a centimetres-wide
+  # random walk, which on the obstacle-free scene has nothing to hit and here has
+  # a 3 cm wall to clip and a 4 cm cube to miss. The corridor, not the controller,
+  # is what changed.
+  #
+  # 0.1 rather than 0.05 or 0: it measures *better* than the deterministic mean
+  # (92% vs 82%), which is the signature of noise helping escape marginal grasps
+  # rather than hurting. Do not read that as headroom to raise it.
+  log_std_init: -2.303
+
+  state_dependent_std: false
+  squash: false
+
+  # 0.15, not 0.5. The ceiling's job is to stop the entropy bonus from walking
+  # sigma back into the regime above; 0.2 already costs 14 points of success and
+  # triples wall contact, so the cap belongs below it.
+  action_std_ceiling: 0.15
+
+anneal:
+  enabled: true
+  rebase_on_resume: false
+
+  # An order of magnitude below the from-scratch 0.01. Entropy is bought to escape
+  # a state with no gradient; after BC there is gradient, and the same bonus now
+  # mostly widens sigma away from the cloned mean.
+  ent_coef:
+    start: 0.001
+    end: 0.0001
+
+  penalties:
+    velocity_penalty:
+      start: 0.005
+      end: 0.005
+      ramp_start: 0.5
+    # To ramp the collision charge instead of running it flat, uncomment this and
+    # set env.reward.collision_penalty to the start value. The annealer reaches it
+    # through ManipulationEnv.set_reward_weights, which accepts any RewardConfig
+    # field name, so no code change is needed.
+    #
+    # collision_penalty:
+    #   start: 1.0
+    #   end: 5.0
+    #   ramp_start: 0.1
+
+ppo:
+  total_timesteps: 10000000
+  num_steps: 256
+  num_minibatches: 32
+
+  # 10, as in pick_place_osc_bc.yaml. This was briefly 4, on the hypothesis that
+  # the actor was chasing an unconverged critic too hard. That was wrong: the real
+  # cause of the collapse was the DAPG anchor scoring demonstrations under unfitted
+  # normalizer statistics (see the bc block), and cutting epochs only starved the
+  # critic further -- target_kl breaks the whole epoch loop, so measured epochs_ran
+  # fell to 1.45 and median explained_variance to 0.16, against 4.00 and 0.49 with
+  # the limit lifted.
+  update_epochs: 10
+
+  # 1e-4, not 3e-4. The first updates after a resume act on a policy that already
+  # encodes a solution, against a critic that has only seen the demonstration
+  # distribution. A large step there is how a warm start gets spent.
+  learning_rate: 1.0e-4
+
+  anneal_lr: true
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  clip_vloss: true
+  ent_coef: 0.001
+  vf_coef: 0.5
+
+  # 10.0, kept from pick_place_osc_bc.yaml, and the collision charge is a reason
+  # to keep it rather than an accident of inheritance: a -5.0/step term makes the
+  # return scale swing harder between episodes than the baseline's did, and at
+  # max_grad_norm 0.5 that swing gets rescaled into the actor's effective step
+  # size. See that config's header for the measurement on the velocity run.
+  max_grad_norm: 10.0
+
+  # 0.02, as in pick_place_osc_bc.yaml. Briefly 0.008, which backfired: the check
+  # runs at epoch boundaries and breaks the loop, so tightening it stopped the
+  # *critic* from training too. Measured over 44 iterations, 0.008 vs disabled:
+  # epochs_ran 1.45 vs 4.00, median explained_variance +0.16 vs +0.49, fraction of
+  # iterations with EV < 0 0.32 vs 0.09. Neither setting prevented the collapse,
+  # which is what ruled the critic out as its cause.
+  target_kl: 0.02
+  normalize_advantage: true
+
+  # 0.75 as elsewhere, but note it is measured against a harder task -- expect it
+  # to take materially longer to trip than it did on the baseline, if it trips.
+  success_threshold: 0.75
+  success_window: 100
+
+  eval_interval: 20
+  checkpoint_interval: 50
+  log_interval: 10
+
+  # Must stay false with the bc block active: the auxiliary term draws a fresh
+  # demonstration minibatch every update, so a fused loss would recompile.
+  compile_update: false
+
+# Auxiliary behavioural-cloning term inside the PPO update (DAPG-style).
+#
+# Pre-training alone is fragile: nothing in the PPO objective preserves the cloned
+# behaviour, and the iterations where it is least protected are the first ones,
+# where the advantage estimates are worst. A decaying likelihood term anchors the
+# policy while the value function catches up.
+bc:
+  enabled: true
+
+  # The barrier-aware 400-episode set, NOT demos/pick_place_osc_400.npz. That one
+  # was recorded on the obstacle-free scene against the baseline's spawn boxes, so
+  # its trajectories start on the wrong side of the wall and drive straight through
+  # where it now stands -- cloning it would anchor the policy to precisely the
+  # behaviour collision_penalty exists to punish. Nothing downstream catches the
+  # mix-up: both sets are 48/4, so the shape check passes and it fails silently.
+  #
+  # Recorded by scripts/record_demos.py, whose waypoint plan crosses the barrier at
+  # altitude in both directions and which discards any episode that touches it
+  # (--require-collision-free, on by default). Yield 400/515 attempts, 53,495
+  # transitions, mean 133.7 steps -- against 102.4 on the baseline set, the extra
+  # ~30 steps being the up-and-over route. Audited: zero transitions carry a
+  # collision charge.
+  demos: demos/pick_place_obstacle_osc_400.npz
+
+  # 0.1 decayed geometrically per iteration: 0.999^1000 = 0.37,
+  # 0.999^2441 = 0.087 over this budget's ~2441 iterations.
+  #
+  # This was briefly 0.3, to hold the policy nearer the clone. That made things
+  # strictly worse, for a reason worth recording: the anchor was itself the thing
+  # destroying the clone (unfitted normalizer statistics, see below), so tripling
+  # its weight tripled the damage. Raising this is only safe once bc_loss is
+  # confirmed to sit near the value pretrain_bc reports.
+  coef: 0.1
+  decay: 0.999
+  batch_size: 256
+
+  # The sigma pretrain_bc.py leaves the cloned policy at, and it must agree with
+  # policy.log_std_init above -- this key is what actually sets the checkpoint's
+  # log_std, so leaving it at its 0.3 default would hand PPO a policy sampling in
+  # the regime the table up there rules out, whatever log_std_init says.
+  final_sigma: 0.1
+
+  # Consumed by scripts/pretrain_bc.py, not by the PPO stage. Re-measured on *this*
+  # dataset rather than inherited -- sweep_holdout.py over 60/100/140/180/220/300 at
+  # an 80/20 episode-boundary split, holdout action MSE:
+  #
+  #   .015168 .013856 .013538 .013543 .013294 .013414
+  #
+  # The curve is flat from 140 on. Seed 0 puts its nominal minimum at 220, but seed
+  # 1 puts it at 140 and makes 220 *worse* (.013378 vs .013725), so that minimum is
+  # noise and 140 is the value both seeds agree on. It is also the conservative end
+  # of the plateau: from 140 to 220 the train MSE falls 24% for a <2% holdout gain,
+  # which is memorization, and holdout value-head EV is no better (0.740 vs 0.737).
+  #
+  # Note the holdout MSE here (~0.0134) is less than half the baseline set's 0.0302.
+  # That is not a better clone -- it is a more stereotyped teacher: the over-the-wall
+  # route is a fixed altitude and a fixed leg order, so there is less action
+  # diversity to fit. Do not read it as this task being easier.
+  epochs: 140
+
+eval:
+  n_episodes: 20
+  deterministic: true
+  base_seed: 1000000
+
+early_stop:
+  enabled: false
+  consecutive: 2

@@ -175,6 +175,7 @@ class PandaRobot:
         self.data = data
         self.gravity_compensation = gravity_compensation
         self.idx = self._resolve_indices(model)
+        self._robot_geom_ids: np.ndarray | None = None
         self._validate_reset_poses()
         self.position_kp, self.position_kd = self._position_gains()
 
@@ -319,12 +320,7 @@ class PandaRobot:
         scratch.qpos[self.idx.finger_qpos_adr] = GRIPPER_JOINT_RANGE[1]
         mujoco.mj_forward(self.model, scratch)
 
-        robot_geoms = set(
-            int(g)
-            for g in np.flatnonzero(
-                np.isin(self.model.geom_bodyid, self._robot_body_ids())
-            )
-        )
+        robot_geoms = set(int(g) for g in self.robot_geom_ids)
         out: list[str] = []
         for c in range(scratch.ncon):
             g1 = int(scratch.contact[c].geom1)
@@ -337,6 +333,30 @@ class PandaRobot:
             n2 = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, g2)
             out.append(f"{n1}<->{n2}")
         return out
+
+    @property
+    def robot_geom_ids(self) -> np.ndarray:
+        """Every geom on the arm chain -- all seven links, hand and both fingers.
+
+        Resolved from the body tree rather than from the ``contype == 1`` bitmask
+        the MJCF uses for the arm, so a scene that adds another geom in that
+        collision class does not silently start counting as part of the robot.
+
+        Cached on first use: the set is fixed by the model, and the callers that
+        want it -- ``pose_collisions`` at construction and the obstacle-collision
+        penalty in ``envs.manipulation_env`` on *every* step -- would otherwise
+        redo the tree walk each time.
+
+        Broader than ``idx.finger_geom_ids`` on purpose. The fingers are what
+        grasp, so they are the only geoms a grasp predicate cares about; a
+        collision predicate has the opposite requirement, because an elbow driven
+        through an obstacle is exactly the failure it exists to catch.
+        """
+        if self._robot_geom_ids is None:
+            self._robot_geom_ids = np.flatnonzero(
+                np.isin(self.model.geom_bodyid, self._robot_body_ids())
+            ).astype(np.int32)
+        return self._robot_geom_ids
 
     def _robot_body_ids(self) -> np.ndarray:
         """Body ids of the arm chain, found by walking up from the fingers."""

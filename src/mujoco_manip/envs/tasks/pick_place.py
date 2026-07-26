@@ -242,10 +242,14 @@ class PickPlaceEnv(ManipulationEnv):
         p_limits = cfg.joint_limit_penalty * float(
             np.sum(self.robot.joint_limit_violation())
         )
+        # Zero on the baseline scene and whenever collision_penalty is 0, which is
+        # its default -- so this line does not change the converged pick_place
+        # reward. See ManipulationEnv._collision_terms.
+        p_collision, collision_terms = self._collision_terms()
 
         reward = (
             r_reach + r_grasp + r_lift + r_place + r_success
-            - p_action - p_velocity - p_limits
+            - p_action - p_velocity - p_limits - p_collision
         )
         terms = {
             "reward/reach": r_reach,
@@ -263,5 +267,6 @@ class PickPlaceEnv(ManipulationEnv):
             "state/gripper_width": self.robot.gripper_width,
             "state/is_grasped": float(grasped),
             "state/carrying": float(carrying),
+            **collision_terms,
         }
         return float(reward), terms
