@@ -167,14 +167,21 @@ networks are effectively throttled by clipping, and the critic tracks its target
 that; it is off by default, and `rollout/episode_return` stays in raw units either way so runs
 remain comparable.
 
-It is not yet usable where it would help most, which is worth knowing before reaching for it.
-Warm-started runs are refused, because `pretrain_bc.py` fits the value head on raw discounted
-demonstration returns (mean ~425) while normalizing rescales the value target by
-~1/std(return) — a critic wrong by orders of magnitude, silently. And from-scratch runs, where
-it *is* allowed, do not exhibit the pathology: 40 iterations from scratch have returns near 20
-and a value loss near 2, so there is nothing for it to fix (measured: `explained_variance`
-+0.49 → +0.71, `grad_norm` 10.5 → 10.3, both already at the clip). Closing that gap means
-normalizing the demonstration returns on the same statistic — a change to `DemoBuffer`.
+Set it in both stages: `pretrain_bc.py` reads the same key, seeds the return statistic from
+the demonstrations, scales the value targets it clones against, and writes
+`checkpoints/return_normalizer.npz`. `train.py` refuses to `--resume` with normalization on
+unless that file exists, because a value head fitted on raw returns against a normalized
+target is a critic wrong by ~std(return) with nothing raised. Measured over 40 warm-started
+iterations, off vs on:
+
+| | `grad_norm` | `value_loss` | `explained_variance` | success @ iter 40 |
+|---|---:|---:|---:|---:|
+| off | 1102 | 13330 | −0.76 | 0.60 |
+| on | **26** | **0.1** | **+0.61** | **0.77** |
+
+The critic goes from worse-than-predicting-the-mean to useful, and the warm start degrades far
+less. Not yet verified over a full 10M-step run — the 95% result above was produced with this
+*off*, so treat the table as a promising 40-iteration signal rather than a new baseline.
 
 **Curriculum seeding can hurt a cloned policy.** The reverse curriculum hands the policy
 states further along the chain, which helps when exploration cannot reach them. But those
@@ -198,7 +205,7 @@ contact. The obstacle config runs sigma 0.1.
 - `manipulation` has no default config, so it is reachable only via
   `scripts/train.py --config`, not the task-name CLI.
 - `docker/` and `notebooks/` are empty placeholders.
-- Reward normalization exists but cannot be combined with a BC warm start (see above).
+- Reward normalization is off by default and unverified over a full-length run (see above).
 
 ## Command reference
 

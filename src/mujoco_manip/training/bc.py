@@ -95,6 +95,7 @@ class DemoBuffer:
         obs_rms: RunningMeanStd | None = None,
         clip: float = 10.0,
         gamma: float = 0.995,
+        return_rms: RunningMeanStd | None = None,
     ) -> None:
         path = Path(path)
         if not path.is_file():
@@ -133,9 +134,27 @@ class DemoBuffer:
             np.asarray(raw_obs, dtype=np.float32), device=device
         )
         self.actions = torch.as_tensor(actions, device=device)
-        self.returns = torch.as_tensor(
-            self._discounted_returns(rewards, starts, lengths, gamma), device=device
-        )
+
+        raw_returns = self._discounted_returns(rewards, starts, lengths, gamma)
+        self._raw_returns = torch.as_tensor(raw_returns, device=device)
+
+        # Return scaling, for runs where PPO normalizes the reward. The value head
+        # cloned here has to predict targets on the same scale PPO will produce, or
+        # the warm start hands over a critic wrong by a factor of std(return) -- ~425
+        # on the 400-episode obstacle set -- with nothing raised. `return_rms` is the
+        # statistic both sides share; seeding it from the demonstrations is what lets
+        # them agree from step one rather than after PPO's running estimate catches
+        # up.
+        #
+        # Note the two quantities are not identical. NormalizeReward accumulates
+        # *backwards-looking* discounted sums during a rollout, while these are the
+        # usual forward discounted returns-to-go, so the seed is an order-of-magnitude
+        # match rather than an exact one -- for this task 425 against ~744 for a
+        # 250-step horizon. That is the point: it removes the initial shock, and the
+        # running statistic adapts from there.
+        self.return_rms = return_rms
+        if return_rms is not None and return_rms.count < 2:
+            return_rms.update(raw_returns.astype(np.float64))
         self.device = device
 
     @staticmethod
@@ -208,6 +227,20 @@ class DemoBuffer:
         the full array on each access, so prefer ``sample``/``epochs`` in a loop.
         """
         return self._whiten(self._raw_observations)
+
+    @property
+    def returns(self) -> Tensor:
+        """Discounted returns, divided by ``return_rms`` when one was supplied.
+
+        Raw and unchanged when it was not, which is every run that does not
+        normalize the reward -- so the default path is bit-identical. A property for
+        the same reason ``observations`` is one: the statistic is a live object the
+        caller may update, and a cached copy would silently go stale.
+        """
+        if self.return_rms is None:
+            return self._raw_returns
+        std = float(self.return_rms.std)
+        return self._raw_returns / std
 
     def sample(self, batch_size: int, generator: torch.Generator | None = None) -> tuple[Tensor, Tensor, Tensor]:
         """Uniform minibatch of ``(obs, actions, returns)``, sampled with replacement."""

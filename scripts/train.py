@@ -49,6 +49,7 @@ from mujoco_manip.envs.manipulation_env import ManipulationEnv  # noqa: E402
 from mujoco_manip.envs.tasks import TASK_REGISTRY, make_reward_config  # noqa: E402
 from mujoco_manip.envs.wrappers.task_space import TaskSpaceWrapper  # noqa: E402
 from mujoco_manip.training.callbacks import (  # noqa: E402
+    RETURN_NORMALIZER_FILENAME,
     ActionStdCeiling,
     CurriculumSchedule,
     EarlyStopOnThreshold,
@@ -489,6 +490,64 @@ def main(argv: list[str] | None = None) -> int:
     # directory, so metrics.jsonl inside it cannot collide with the real run's.
     # Keeping the standard name also means plot_results.py can plot a smoke run,
     # which is how the plotting path itself gets exercised.
+    # Optional return-scale normalization of the reward PPO learns from. Off unless
+    # asked for, so every existing config is bit-identical.
+    #
+    # What it is for: episode returns on the pick-and-place tasks run ~2500
+    # unnormalized, which puts the value loss near 1.7e4 and the global gradient
+    # norm near 1000 against a max_grad_norm of 10 -- so clipping scales *both*
+    # networks down by ~100x and the critic never catches its target
+    # (explained_variance ~0.4). Dividing the reward by the running standard
+    # deviation of the discounted return brings the value target to order 1.
+    #
+    # What it costs: NormalizeReward's own docstring makes the argument against it,
+    # and that argument is real -- this reward is deliberately built from bounded
+    # 1 - tanh(k*d) terms with hand-chosen stage weights. The scaling is a single
+    # scalar applied to the whole reward, so it preserves the *ratios* between those
+    # weights, but it does tie the effective learning rate to whatever the return
+    # happens to look like early in a run. Treat it as an experiment, not a default.
+    norm_reward_cfg = config.get("normalize_reward", {}) or {}
+    reward_normalizer: NormalizeReward | None = None
+    if norm_reward_cfg.get("enabled", False):
+        unknown = sorted(set(norm_reward_cfg) - {"enabled", "clip"})
+        if unknown:
+            raise SystemExit(
+                f"unknown normalize_reward keys: {unknown}; have ['clip', 'enabled']"
+            )
+        reward_normalizer = NormalizeReward(
+            num_envs=int(env_cfg.get("num_envs", 8)),
+            gamma=ppo_config.gamma,
+            clip=float(norm_reward_cfg.get("clip", 10.0)),
+        )
+        LOGGER.info(
+            "reward norm  on (clip %.3g) -- rollout/episode_return stays raw; "
+            "train/reward_scale logs the divisor",
+            float(norm_reward_cfg.get("clip", 10.0)),
+        )
+        # A resumed run must inherit the return statistic its value head was cloned
+        # against. scripts/pretrain_bc.py seeds that statistic from the demonstration
+        # returns and writes it beside the checkpoint; without it, normalizing here
+        # rescales the value target by ~1/std(return) while the critic still predicts
+        # raw-scale returns -- mean ~425 on the 400-episode obstacle set -- and
+        # nothing raises. It presents as advantages that are noise for hundreds of
+        # iterations, which is exactly how an 87% warm start got walked to 2% once.
+        if resume_dir is not None:
+            source = resolve_run_dir(args.resume, smoke=False) / "checkpoints"
+            loaded = NormalizerCheckpoint(
+                reward_normalizer.return_rms, source,
+                filename=RETURN_NORMALIZER_FILENAME, label="return",
+            ).load()
+            if not loaded:
+                raise SystemExit(
+                    f"normalize_reward.enabled with --resume, but no "
+                    f"{RETURN_NORMALIZER_FILENAME} under {source}. That checkpoint's "
+                    f"value head was fitted on unnormalized returns, so normalizing "
+                    f"now would rescale the value target by ~1/std(return) and leave "
+                    f"the critic wrong by orders of magnitude, silently.\n"
+                    f"  Re-run scripts/pretrain_bc.py with normalize_reward.enabled "
+                    f"set, which writes that file, or leave normalization off."
+                )
+
     callbacks: list[Any] = [
         ProgressCallback(every_n_iterations=max(1, ppo_config.log_interval)),
         # Advances the reverse curriculum's seeding probability. Installed
@@ -530,6 +589,16 @@ def main(argv: list[str] | None = None) -> int:
     if obs_rms is not None:
         normalizer_ckpt = NormalizerCheckpoint(obs_rms, run_dir / "checkpoints")
         callbacks.append(normalizer_ckpt)
+    if reward_normalizer is not None:
+        # The return statistic keeps updating from rollouts, so it is checkpointed
+        # like the observation one -- a mid-run resume that reverted to the
+        # demonstration seed would step the value scale mid-training.
+        callbacks.append(
+            NormalizerCheckpoint(
+                reward_normalizer.return_rms, run_dir / "checkpoints",
+                filename=RETURN_NORMALIZER_FILENAME, label="return",
+            )
+        )
     if stop_cfg.get("enabled", False):
         callbacks.append(
             EarlyStopOnThreshold(consecutive=int(stop_cfg.get("consecutive", 2)))
@@ -542,60 +611,6 @@ def main(argv: list[str] | None = None) -> int:
     # the demonstrations by a different transform than the rollouts get, and the
     # auxiliary term would be pulling the policy toward a distribution it never
     # sees.
-    # Optional return-scale normalization of the reward PPO learns from. Off unless
-    # asked for, so every existing config is bit-identical.
-    #
-    # What it is for: episode returns on the pick-and-place tasks run ~2500
-    # unnormalized, which puts the value loss near 1.7e4 and the global gradient
-    # norm near 1000 against a max_grad_norm of 10 -- so clipping scales *both*
-    # networks down by ~100x and the critic never catches its target
-    # (explained_variance ~0.4). Dividing the reward by the running standard
-    # deviation of the discounted return brings the value target to order 1.
-    #
-    # What it costs: NormalizeReward's own docstring makes the argument against it,
-    # and that argument is real -- this reward is deliberately built from bounded
-    # 1 - tanh(k*d) terms with hand-chosen stage weights. The scaling is a single
-    # scalar applied to the whole reward, so it preserves the *ratios* between those
-    # weights, but it does tie the effective learning rate to whatever the return
-    # happens to look like early in a run. Treat it as an experiment, not a default.
-    norm_reward_cfg = config.get("normalize_reward", {}) or {}
-    reward_normalizer: NormalizeReward | None = None
-    if norm_reward_cfg.get("enabled", False):
-        unknown = sorted(set(norm_reward_cfg) - {"enabled", "clip"})
-        if unknown:
-            raise SystemExit(
-                f"unknown normalize_reward keys: {unknown}; have ['clip', 'enabled']"
-            )
-        reward_normalizer = NormalizeReward(
-            num_envs=int(env_cfg.get("num_envs", 8)),
-            gamma=ppo_config.gamma,
-            clip=float(norm_reward_cfg.get("clip", 10.0)),
-        )
-        LOGGER.info(
-            "reward norm  on (clip %.3g) -- rollout/episode_return stays raw; "
-            "train/reward_scale logs the divisor",
-            float(norm_reward_cfg.get("clip", 10.0)),
-        )
-        # Refuse the combination that fails silently. scripts/pretrain_bc.py fits
-        # the value head on *raw* discounted demonstration returns -- mean ~425 on
-        # the 400-episode obstacle set -- while a normalized run drives the value
-        # target to order 1. Resuming one into the other hands PPO a critic
-        # mis-scaled by a factor of hundreds, which does not raise: it presents as
-        # advantages that are noise for the first few hundred iterations, which is
-        # exactly how an 87% warm start got walked down to 2% once already.
-        if resume_dir is not None:
-            raise SystemExit(
-                "normalize_reward.enabled with --resume is refused: a checkpoint's "
-                "value head was fitted on unnormalized returns (pretrain_bc.py uses "
-                "raw discounted demo returns, mean ~425), and normalizing the reward "
-                "rescales the value target by ~1/std(return). The critic would be "
-                "wrong by orders of magnitude with no error raised.\n"
-                "  Either train from scratch with normalization on, or leave it off "
-                "for warm-started runs. Making the two compatible means normalizing "
-                "the demonstration returns on the same statistic -- a change to "
-                "DemoBuffer, not a config key."
-            )
-
     bc_cfg = config.get("bc", {}) or {}
     if bc_cfg.get("enabled", False):
         unknown = sorted(set(bc_cfg) - _BC_KEYS)

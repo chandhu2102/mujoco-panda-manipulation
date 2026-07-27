@@ -495,6 +495,15 @@ class TensorBoardCallback(TrainerCallback):
         self.writer.close()
 
 
+RETURN_NORMALIZER_FILENAME = "return_normalizer.npz"
+"""Basename for the reward normalizer's return statistic.
+
+Named here rather than in either caller because scripts/pretrain_bc.py writes it
+and scripts/train.py reads it; a literal duplicated across the two is how a warm
+start silently stops finding it.
+"""
+
+
 class NormalizerCheckpoint(TrainerCallback):
     """Persist observation-normalizer statistics alongside policy checkpoints.
 
@@ -505,6 +514,10 @@ class NormalizerCheckpoint(TrainerCallback):
     """
 
     FILENAME = "obs_normalizer.npz"
+    """Default basename. Override per instance with ``filename`` -- the same
+    persistence works for any RunningMeanStd, and the reward normalizer's return
+    statistic needs exactly this treatment for the same reason: it is state the
+    policy's behaviour depends on that the torch checkpoint knows nothing about."""
 
     def __init__(
         self,
@@ -512,13 +525,17 @@ class NormalizerCheckpoint(TrainerCallback):
         directory: str | Path,
         *,
         every_n_iterations: int = 25,
+        filename: str | None = None,
+        label: str = "observation",
     ) -> None:
         self.rms = target.obs_rms if isinstance(target, NormalizeObservation) else target
         self.directory = Path(directory)
         self.every = max(1, int(every_n_iterations))
+        self.filename = filename or self.FILENAME
+        self.label = label
 
     def path(self) -> Path:
-        return self.directory / self.FILENAME
+        return self.directory / self.filename
 
     def save(self) -> Path:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -550,7 +567,7 @@ class NormalizerCheckpoint(TrainerCallback):
                     "count": float(data["count"]),
                 }
             )
-        LOGGER.info("Loaded observation normalizer (count=%.0f) from %s", self.rms.count, path)
+        LOGGER.info("Loaded %s normalizer (count=%.0f) from %s", self.label, self.rms.count, path)
         return True
 
     def on_iteration_end(self, trainer: PPOTrainer, metrics: dict[str, float]) -> None:
@@ -563,7 +580,7 @@ class NormalizerCheckpoint(TrainerCallback):
         self.save()
 
     def on_training_end(self, trainer: PPOTrainer) -> None:
-        LOGGER.info("Saved observation normalizer to %s", self.save())
+        LOGGER.info("Saved %s normalizer to %s", self.label, self.save())
 
 
 class EarlyStopOnThreshold(TrainerCallback):

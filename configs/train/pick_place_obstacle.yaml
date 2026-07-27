@@ -166,11 +166,22 @@ normalize_obs:
 # weights -- but it does tie the effective learning rate to whatever the return
 # looks like early on, and the run that reached 95% did so without it.
 #
+# Measured over 40 warm-started iterations on this task, off vs on:
+#
+#     grad_norm  1102 -> 26      value_loss 13330 -> 0.1
+#     expl_var  -0.76 -> +0.61   success@40  0.60 -> 0.77
+#
+# The critic goes from worse-than-predicting-the-mean to genuinely useful, and the
+# warm start degrades far less over the same window. Not yet verified over a full
+# 10M-step run -- the 95% result was produced with this OFF.
+#
 # Two things to know before enabling:
-#   * It cannot be combined with --resume. train.py refuses, because pretrain_bc.py
-#     fits the value head on raw discounted demo returns (mean ~425) and normalizing
-#     rescales the target by ~1/std(return) -- a critic wrong by orders of magnitude,
-#     with nothing raised. So this is a from-scratch-only experiment today.
+#   * It must be set for BOTH stages. pretrain_bc.py reads this key too: it seeds the
+#     return statistic from the demonstrations, scales the value targets it clones
+#     against, and writes checkpoints/return_normalizer.npz. train.py refuses to
+#     --resume with normalization on unless that file is there, because a value head
+#     fitted on raw returns (mean ~425) against a normalized target is a critic wrong
+#     by ~std(return) with nothing raised.
 #   * rollout/episode_return stays in raw units, so it remains comparable with every
 #     previous run. train/reward_scale logs the divisor; if it stays at 1.0 the
 #     normalizer is doing nothing.

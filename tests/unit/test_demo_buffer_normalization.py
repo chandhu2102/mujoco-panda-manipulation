@@ -179,6 +179,53 @@ def test_sample_and_epochs_return_whitened_rows() -> None:
         assert seen > 0
 
 
+def test_returns_are_raw_without_a_return_rms() -> None:
+    """The default path must be untouched: no return_rms means no scaling.
+
+    Every run that does not normalize the reward goes through here, including the
+    converged pick_place baseline, so this is the bit-identical guarantee.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "demos.npz"
+        _write_demos(path)
+        buf = _buffer(path, RunningMeanStd((OBS_DIM,)))
+        assert buf.return_rms is None
+        assert torch.equal(buf.returns, buf._raw_returns)
+
+
+def test_return_rms_is_seeded_and_scales_the_value_targets() -> None:
+    """Return scaling for reward-normalized runs, and why it has to be shared.
+
+    ``scripts/pretrain_bc.py`` clones the value head against these targets while
+    PPO's ``NormalizeReward`` divides its rewards by the same statistic. If the two
+    disagree the warm start hands over a critic mis-scaled by ~std(return) -- 122 on
+    the obstacle demonstration set -- and nothing raises. Measured consequence of
+    getting it right, over 40 warm-started iterations: explained_variance -0.76 ->
+    +0.61 and gradient norm 1102 -> 26.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "demos.npz"
+        _write_demos(path)
+
+        return_rms = RunningMeanStd(())
+        buf = DemoBuffer(
+            path, device=torch.device("cpu"), obs_rms=RunningMeanStd((OBS_DIM,)),
+            clip=CLIP, gamma=0.995, return_rms=return_rms,
+        )
+        # Seeded from the demonstrations, so both stages agree from step one rather
+        # than after PPO's running estimate catches up.
+        assert return_rms.count == len(buf), "return_rms was not seeded from the demos"
+
+        std = float(return_rms.std)
+        assert std > 1.0, "the seed should be the return scale, not a placeholder"
+        assert torch.allclose(buf.returns, buf._raw_returns / std)
+
+        # Live, not a snapshot -- same reason `observations` is a property.
+        return_rms.update(np.full(64, 1e4))
+        assert float(return_rms.std) != std
+        assert torch.allclose(buf.returns, buf._raw_returns / float(return_rms.std))
+
+
 def test_clip_is_applied() -> None:
     """Whitened values stay inside +/- clip, which bounds a blown-up observation."""
     with tempfile.TemporaryDirectory() as tmp:

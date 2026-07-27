@@ -51,7 +51,11 @@ if str(_REPO_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 
 from mujoco_manip.training.bc import BCConfig, BCPretrainer, DemoBuffer  # noqa: E402
-from mujoco_manip.training.callbacks import NormalizerCheckpoint  # noqa: E402
+from mujoco_manip.algos.common.normalizers import RunningMeanStd  # noqa: E402
+from mujoco_manip.training.callbacks import (  # noqa: E402
+    RETURN_NORMALIZER_FILENAME,
+    NormalizerCheckpoint,
+)
 from train import (  # noqa: E402
     build_policy,
     load_config,
@@ -115,7 +119,23 @@ def main(argv: list[str] | None = None) -> int:
     gamma = float(config.get("ppo", {}).get("gamma", 0.995))
     clip = float(config.get("normalize_obs", {}).get("clip", 10.0))
 
-    demos = DemoBuffer(demos_path, device=device, clip=clip, gamma=gamma)
+    # When the PPO stage normalizes the reward, the value head has to be cloned
+    # against the same return scale, or the warm start hands over a critic wrong by
+    # a factor of std(return). DemoBuffer seeds this statistic from the
+    # demonstrations and divides its returns by it; train.py loads the same file
+    # into NormalizeReward so both stages agree from step one.
+    norm_reward_cfg = config.get("normalize_reward", {}) or {}
+    return_rms = RunningMeanStd(()) if norm_reward_cfg.get("enabled", False) else None
+
+    demos = DemoBuffer(
+        demos_path, device=device, clip=clip, gamma=gamma, return_rms=return_rms
+    )
+    if return_rms is not None:
+        LOGGER.info(
+            "return norm  value targets scaled by std(demo return)=%.2f "
+            "(raw mean %.1f); PPO must run with normalize_reward.enabled",
+            float(return_rms.std), float(demos._raw_returns.mean()),
+        )
     if (demos.obs_dim, demos.action_dim) != (obs_dim, action_dim):
         raise SystemExit(
             f"demonstration shapes {(demos.obs_dim, demos.action_dim)} do not match "
@@ -163,6 +183,11 @@ def main(argv: list[str] | None = None) -> int:
     # Statistics first: a checkpoint present without them is the failure mode
     # train.py can only warn about.
     NormalizerCheckpoint(demos.obs_rms, checkpoints).save()
+    if return_rms is not None:
+        NormalizerCheckpoint(
+            return_rms, checkpoints,
+            filename=RETURN_NORMALIZER_FILENAME, label="return",
+        ).save()
 
     payload = {
         "policy": policy.state_dict(),
