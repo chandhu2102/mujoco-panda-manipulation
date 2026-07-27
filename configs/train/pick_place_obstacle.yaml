@@ -148,6 +148,36 @@ normalize_obs:
   # 0.053 means the clone genuinely fits better).
   freeze: false
 
+# Return-scale normalization of the reward PPO learns from. OFF, and present mainly
+# so the option is documented and can be flipped with --set (load_config refuses a
+# --set on a key that is not already in the file).
+#
+# The case for turning it on: this task's episode returns run ~2500 unnormalized,
+# which puts train/value_loss near 1.7e4 and train/grad_norm near 1000 against a
+# max_grad_norm of 10. Global clipping therefore scales the actor *and* critic down
+# by ~100x every step, and the critic never catches its target --
+# train/explained_variance sat around +0.4 for the whole converged run. Dividing the
+# reward by the running standard deviation of the discounted return brings the value
+# target to order 1 and the gradient under the clip.
+#
+# The case against, from NormalizeReward's own docstring: this reward is built from
+# bounded 1 - tanh(k*d) terms with hand-chosen stage weights. The scaling is one
+# scalar applied to the whole reward, so it preserves the ratios between those
+# weights -- but it does tie the effective learning rate to whatever the return
+# looks like early on, and the run that reached 95% did so without it.
+#
+# Two things to know before enabling:
+#   * It cannot be combined with --resume. train.py refuses, because pretrain_bc.py
+#     fits the value head on raw discounted demo returns (mean ~425) and normalizing
+#     rescales the target by ~1/std(return) -- a critic wrong by orders of magnitude,
+#     with nothing raised. So this is a from-scratch-only experiment today.
+#   * rollout/episode_return stays in raw units, so it remains comparable with every
+#     previous run. train/reward_scale logs the divisor; if it stays at 1.0 the
+#     normalizer is doing nothing.
+normalize_reward:
+  enabled: false
+  clip: 10.0
+
 policy:
   hidden_sizes: [256, 256]
   activation: tanh

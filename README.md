@@ -160,11 +160,21 @@ that forfeited sum, the return-maximizing behaviour is to hover just outside the
 and farm the shaping term. Measured on `reach`: hovering 9 cm out scored 5× an actual
 success, and a run duly converged to it while its shaped return kept climbing.
 
-**Returns are unnormalized, and it shows.** Episode returns run ~2500 with a value loss
-around 1.7e4, so the gradient norm sits near 1000 against a `max_grad_norm` of 10 — both
+**Returns are unnormalized by default, and it shows.** Episode returns run ~2500 with a value
+loss around 1.7e4, so the gradient norm sits near 1000 against a `max_grad_norm` of 10 — both
 networks are effectively throttled by clipping, and the critic tracks its target poorly
-(`explained_variance` ~0.4). `NormalizeReward` exists in `algos/common/normalizers.py` and is
-deliberately unwired. This is the most obvious remaining lever.
+(`explained_variance` ~0.4). `normalize_reward.enabled` wires `NormalizeReward` in to fix
+that; it is off by default, and `rollout/episode_return` stays in raw units either way so runs
+remain comparable.
+
+It is not yet usable where it would help most, which is worth knowing before reaching for it.
+Warm-started runs are refused, because `pretrain_bc.py` fits the value head on raw discounted
+demonstration returns (mean ~425) while normalizing rescales the value target by
+~1/std(return) — a critic wrong by orders of magnitude, silently. And from-scratch runs, where
+it *is* allowed, do not exhibit the pathology: 40 iterations from scratch have returns near 20
+and a value loss near 2, so there is nothing for it to fix (measured: `explained_variance`
++0.49 → +0.71, `grad_norm` 10.5 → 10.3, both already at the clip). Closing that gap means
+normalizing the demonstration returns on the same statistic — a change to `DemoBuffer`.
 
 **Curriculum seeding can hurt a cloned policy.** The reverse curriculum hands the policy
 states further along the chain, which helps when exploration cannot reach them. But those
@@ -188,7 +198,7 @@ contact. The obstacle config runs sigma 0.1.
 - `manipulation` has no default config, so it is reachable only via
   `scripts/train.py --config`, not the task-name CLI.
 - `docker/` and `notebooks/` are empty placeholders.
-- Reward return scaling is unwired (see above).
+- Reward normalization exists but cannot be combined with a BC warm start (see above).
 
 ## Command reference
 

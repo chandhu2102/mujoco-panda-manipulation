@@ -42,6 +42,7 @@ if str(_REPO_ROOT / "src") not in sys.path:
 from mujoco_manip.algos.common.networks import ActorCritic  # noqa: E402
 from mujoco_manip.algos.common.normalizers import (  # noqa: E402
     NormalizeObservation,
+    NormalizeReward,
     RunningMeanStd,
 )
 from mujoco_manip.envs.manipulation_env import ManipulationEnv  # noqa: E402
@@ -541,6 +542,60 @@ def main(argv: list[str] | None = None) -> int:
     # the demonstrations by a different transform than the rollouts get, and the
     # auxiliary term would be pulling the policy toward a distribution it never
     # sees.
+    # Optional return-scale normalization of the reward PPO learns from. Off unless
+    # asked for, so every existing config is bit-identical.
+    #
+    # What it is for: episode returns on the pick-and-place tasks run ~2500
+    # unnormalized, which puts the value loss near 1.7e4 and the global gradient
+    # norm near 1000 against a max_grad_norm of 10 -- so clipping scales *both*
+    # networks down by ~100x and the critic never catches its target
+    # (explained_variance ~0.4). Dividing the reward by the running standard
+    # deviation of the discounted return brings the value target to order 1.
+    #
+    # What it costs: NormalizeReward's own docstring makes the argument against it,
+    # and that argument is real -- this reward is deliberately built from bounded
+    # 1 - tanh(k*d) terms with hand-chosen stage weights. The scaling is a single
+    # scalar applied to the whole reward, so it preserves the *ratios* between those
+    # weights, but it does tie the effective learning rate to whatever the return
+    # happens to look like early in a run. Treat it as an experiment, not a default.
+    norm_reward_cfg = config.get("normalize_reward", {}) or {}
+    reward_normalizer: NormalizeReward | None = None
+    if norm_reward_cfg.get("enabled", False):
+        unknown = sorted(set(norm_reward_cfg) - {"enabled", "clip"})
+        if unknown:
+            raise SystemExit(
+                f"unknown normalize_reward keys: {unknown}; have ['clip', 'enabled']"
+            )
+        reward_normalizer = NormalizeReward(
+            num_envs=int(env_cfg.get("num_envs", 8)),
+            gamma=ppo_config.gamma,
+            clip=float(norm_reward_cfg.get("clip", 10.0)),
+        )
+        LOGGER.info(
+            "reward norm  on (clip %.3g) -- rollout/episode_return stays raw; "
+            "train/reward_scale logs the divisor",
+            float(norm_reward_cfg.get("clip", 10.0)),
+        )
+        # Refuse the combination that fails silently. scripts/pretrain_bc.py fits
+        # the value head on *raw* discounted demonstration returns -- mean ~425 on
+        # the 400-episode obstacle set -- while a normalized run drives the value
+        # target to order 1. Resuming one into the other hands PPO a critic
+        # mis-scaled by a factor of hundreds, which does not raise: it presents as
+        # advantages that are noise for the first few hundred iterations, which is
+        # exactly how an 87% warm start got walked down to 2% once already.
+        if resume_dir is not None:
+            raise SystemExit(
+                "normalize_reward.enabled with --resume is refused: a checkpoint's "
+                "value head was fitted on unnormalized returns (pretrain_bc.py uses "
+                "raw discounted demo returns, mean ~425), and normalizing the reward "
+                "rescales the value target by ~1/std(return). The critic would be "
+                "wrong by orders of magnitude with no error raised.\n"
+                "  Either train from scratch with normalization on, or leave it off "
+                "for warm-started runs. Making the two compatible means normalizing "
+                "the demonstration returns on the same statistic -- a change to "
+                "DemoBuffer, not a config key."
+            )
+
     bc_cfg = config.get("bc", {}) or {}
     if bc_cfg.get("enabled", False):
         unknown = sorted(set(bc_cfg) - _BC_KEYS)
@@ -563,6 +618,7 @@ def main(argv: list[str] | None = None) -> int:
                     float(bc_cfg.get("coef", 0.1)), float(bc_cfg.get("decay", 0.999)))
         trainer = DAPGTrainer(
             venv, policy, ppo_config, demos,
+            reward_normalizer=reward_normalizer,
             bc_coef=float(bc_cfg.get("coef", 0.1)),
             bc_decay=float(bc_cfg.get("decay", 0.999)),
             bc_batch_size=int(bc_cfg.get("batch_size", 256)),
@@ -570,7 +626,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         trainer = PPOTrainer(
-            venv, policy, ppo_config, callbacks=callbacks, evaluator=evaluator
+            venv, policy, ppo_config, callbacks=callbacks, evaluator=evaluator,
+            reward_normalizer=reward_normalizer,
         )
 
     # -- resume ------------------------------------------------------------ #

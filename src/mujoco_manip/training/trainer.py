@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from ..algos.common.normalizers import NormalizeReward
+
 LOGGER = logging.getLogger(__name__)
 
 __all__ = [
@@ -636,12 +638,27 @@ class PPOTrainer:
         optimizer: torch.optim.Optimizer | None = None,
         callbacks: Sequence[TrainerCallback] = (),
         evaluator: Evaluator | None = None,
+        reward_normalizer: NormalizeReward | None = None,
     ) -> None:
         self.env = env
         self.policy = policy
         self.cfg = config or PPOConfig()
         self.evaluator = evaluator
         self.callbacks = CallbackList(callbacks)
+
+        self.reward_normalizer = reward_normalizer
+        """Optional return-scale normalizer applied to the reward PPO *learns* from.
+
+        Held here rather than wrapped around the env, which is the arrangement that
+        matters: the raw reward still reaches ``rollout/episode_return`` and the
+        per-term diagnostics, so those stay in the units every previous run reported
+        and remain comparable. Only ``buffer.rewards`` -- and therefore the GAE
+        targets and the value loss -- sees the scaled version. A wrapper would
+        normalize before the trainer ever saw the reward and make that split
+        impossible.
+
+        None (the default) leaves every existing run bit-identical.
+        """
 
         self.num_envs = int(env.num_envs)
         self.cfg.validate(self.num_envs)
@@ -762,6 +779,14 @@ class PPOTrainer:
             reward_np = np.asarray(reward, dtype=np.float64).reshape(-1)
             episode_over = terminated | truncated
 
+            # Scaled for learning, raw for reporting. The normalizer needs the
+            # episode boundary so its discounted accumulator resets there rather
+            # than drifting toward the scale of an infinitely long episode.
+            if self.reward_normalizer is not None:
+                learn_reward = self.reward_normalizer(reward_np, episode_over)
+            else:
+                learn_reward = reward_np
+
             if buffer is None:
                 buffer = self._lazy_init_buffer(obs_t, action)
                 buffer.reset()
@@ -769,7 +794,7 @@ class PPOTrainer:
                 obs=obs_t,
                 action=action,
                 logprob=logprob,
-                reward=self._to_tensor(reward_np),
+                reward=self._to_tensor(learn_reward),
                 value=value,
                 done=done_t,
             )
@@ -829,8 +854,18 @@ class PPOTrainer:
         metrics = {
             "rollout/sps": cfg.batch_size(self.num_envs) / max(elapsed, 1e-9),
             "rollout/episodes": float(episodes_this_rollout),
+            # Note this is the *scaled* reward when a reward normalizer is active,
+            # since it reads the buffer. rollout/episode_return stays raw.
             "rollout/mean_reward": float(buffer.rewards.mean()),
         }
+        if self.reward_normalizer is not None:
+            # The divisor, logged because it is the whole mechanism: it should climb
+            # from 1.0 and settle near the standard deviation of the discounted
+            # return. A value pinned at 1.0 means the normalizer is not doing
+            # anything, which is indistinguishable from it being off.
+            metrics["train/reward_scale"] = float(
+                self.reward_normalizer.return_rms.std
+            )
         if self._episode_returns:
             metrics["rollout/episode_return"] = float(np.mean(self._episode_returns))
             metrics["rollout/episode_length"] = float(np.mean(self._episode_lengths))
