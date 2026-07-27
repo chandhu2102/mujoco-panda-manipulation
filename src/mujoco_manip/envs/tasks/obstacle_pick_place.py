@@ -3,8 +3,8 @@
 Everything about the reward is inherited from ``PickPlaceEnv``. What makes this a
 harder task is not a new reward term but a *changed geometry*: the object spawn
 box and the goal box are moved onto opposite sides of the static ``obstacle``
-wall defined in ``assets/panda_scene.xml``, so the transport phase has to clear
-it. The collision charge (``RewardConfig.collision_penalty``, scanned by
+wall defined in ``assets/panda_scene_obstacle.xml``, so the transport phase has to
+clear it. The collision charge (``RewardConfig.collision_penalty``, scanned by
 ``ManipulationEnv.obstacle_contacts``) is what prices the alternative of pushing
 through.
 
@@ -13,21 +13,21 @@ The spawn boxes are not reachable from YAML -- ``scripts/train.py:make_env_fn``
 forwards ``reward``, ``curriculum_level`` and the task-space block, but never a
 ``randomization`` block -- so a split has to live in Python either way. Putting it
 here rather than in ``pick_place.py`` keeps the converged 4-D OSC baseline
-runnable and directly comparable on this branch: ``task: pick_place`` still
-samples the boxes the 400 demonstrations were recorded against.
+runnable and directly comparable: ``task: pick_place`` still samples the boxes the
+400 demonstrations were recorded against.
 
-The one thing this task *does* share with the baseline against its will is the
-scene file. The obstacle went into ``assets/panda_scene.xml`` itself, which
-``ManipulationEnv`` resolves as ``DEFAULT_SCENE``, so the wall is physically
-present for ``task: pick_place`` too. It costs that baseline nothing in reward --
-``collision_penalty`` defaults to 0.0 -- but it does mean the baseline's spawn box
-(x 0.42-0.58) now straddles a wall at x 0.465-0.495. Two consequences worth
-knowing: ``demos/pick_place_osc_400.npz`` was recorded without the wall and its
-trajectories drive straight through where it now stands, and a re-run of the
-baseline on this branch is no longer the run that converged. If either matters,
-give this class its own scene instead -- ``scene_path`` is already a constructor
-argument on ``ManipulationEnv``, so it is a one-line default here plus a copy of
-the asset with the obstacle in it.
+The barrier is likewise isolated to its own scene. This class defaults
+``scene_path`` to ``OBSTACLE_SCENE``, which is ``DEFAULT_SCENE`` plus one geom by
+``<include>``, so ``pick_place`` compiles a model with no wall in it at all -- 14
+geoms against this task's 15. That matters for two reasons beyond tidiness:
+``demos/pick_place_osc_400.npz`` was recorded on the obstacle-free scene and stays
+valid for the task it belongs to, and the baseline remains bit-reproducible rather
+than being a different physical problem wearing the same config.
+
+The barrier was briefly in ``panda_scene.xml`` itself, which cost the baseline
+nothing in reward -- ``collision_penalty`` defaults to 0.0 -- but did put a wall
+through the middle of its spawn box. Composing by include rather than copying is
+what keeps the two scenes from drifting apart; see the asset's own header.
 
 Geometry, all measured against the wall at x 0.465-0.495, top face z 0.50:
 
@@ -54,11 +54,16 @@ Geometry, all measured against the wall at x 0.465-0.495, top face z 0.50:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from ..manipulation_env import OBSTACLE_GEOM_PREFIX, RandomizationConfig
+from ..manipulation_env import (
+    OBSTACLE_GEOM_PREFIX,
+    OBSTACLE_SCENE,
+    RandomizationConfig,
+)
 from .pick_place import PickPlaceEnv, PickPlaceRewardConfig
 
 __all__ = [
@@ -125,12 +130,17 @@ class ObstaclePickPlaceEnv(PickPlaceEnv):
 
     def __init__(
         self,
+        scene_path: str | Path = OBSTACLE_SCENE,
         *args: Any,
         reward_config: PickPlaceRewardConfig | None = None,
         randomization: RandomizationConfig | None = None,
         **kwargs: Any,
     ) -> None:
+        # scene_path is declared positionally and first, matching ManipulationEnv,
+        # so `ObstaclePickPlaceEnv(some_path)` still means what it means everywhere
+        # else. Only the default differs.
         super().__init__(
+            scene_path,
             *args,
             reward_config=reward_config or ObstaclePickPlaceRewardConfig(),
             randomization=randomization or OBSTACLE_PICK_PLACE_RANDOMIZATION,

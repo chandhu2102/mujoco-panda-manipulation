@@ -1,0 +1,86 @@
+<mujoco model="panda_obstacle_scene">
+  <!--
+    The manipulation scene plus a static barrier between the object and the goal.
+    Used by envs.tasks.obstacle_pick_place.ObstaclePickPlaceEnv, which defaults its
+    `scene_path` here; every other task keeps panda_scene.xml.
+
+    Composed by <include> rather than copied. The whole point of the obstacle task
+    is that it differs from the pick_place baseline in exactly one respect, so a
+    second copy of the scene would be two files that must be kept identical by hand
+    -- and the first divergence to slip through would silently make the two tasks
+    incomparable, which is the one thing this benchmark exists to avoid. Everything
+    below is the difference; everything else is inherited.
+
+    Note the base scene compiles its cube at x = 0.58 partly for this file's
+    benefit: at the 0.5 centre it would sit inside the wall added here.
+  -->
+
+  <include file="panda_scene.xml"/>
+
+  <asset>
+    <!-- Deliberately the highest-contrast colour in the scene: it must be
+         unmistakable in scripts/enjoy.py against a tan table, a red cube and a
+         translucent green goal marker. -->
+    <material name="obstacle_mat" rgba="0.30 0.18 0.62 1" specular="0.4"
+              reflectance="0.05"/>
+  </asset>
+
+  <worldbody>
+    <!--
+      Static wall, so it is part of the scene rather than the physics state and can
+      never be knocked over or dragged -- the policy has to go over it.
+
+      Geometry, and why each number is what it is:
+
+        * centred at x = 0.48, y = 0, spanning x 0.465-0.495. That plane is what
+          makes it a divider: envs.tasks.obstacle_pick_place spawns the object at
+          x 0.56-0.61 and the goal at x 0.37-0.43, so *every* episode has to cross
+          it while carrying the cube. It also sits just past the ready_low reset
+          TCP at x ~= 0.450, so the arm starts on the goal side and the barrier is
+          between it and the object -- reaching over is the first thing the policy
+          has to do, not the last.
+
+          x = 0.48 rather than the 0.51 centre of the table, and that 3 cm is not
+          cosmetic. The hand geom is 10 cm long along the jaw axis, so a grasp
+          needs roughly 6.5 cm between the wall face and the object centre for
+          *any* wrist yaw to clear. Measured over 235 curriculum seeds: at a far
+          face of 0.525 the seeder could not place the arm without touching the
+          wall on 18.7% of attempts even after preferring collision-free yaws; at
+          0.495 that falls to 1.7%, which is at or below the obstacle-free
+          baseline. Move this back toward 0.51 only together with the object
+          spawn box in obstacle_pick_place.py, and re-measure the seed rate.
+        * 0.015 half-extent in x (3 cm thick). Thin, because the cost that
+          matters is the height, and every extra centimetre of thickness is taken
+          out of the two spawn boxes on either side.
+        * 0.25 half-extent in y (50 cm wide). Wider than the reachable workspace
+          (y +-0.28 under the OSC task_space bounds), so going *around* the end is
+          not an available solution and the only way across is over the top.
+          Shorten this to ~0.15 for an easier variant that admits the wide detour.
+        * top face at z = 0.50, i.e. 10 cm of clear wall above a table top at
+          z = 0.40. A cube carried at its resting height (centre z = 0.42) is
+          blocked; clearing the wall needs the cube centre above 0.52, a 10 cm
+          lift against a reward whose lift_target is 0.12. That crossing altitude
+          is deliberately *above* the floor of the goal_z band (0.50-0.62), so the
+          cube has to go up over the wall and then back down onto a low goal
+          rather than riding a single monotone rise -- and the lift the wall forces
+          stays inside the OSC workspace ceiling of 0.75.
+
+          Not higher, because the barrier competes with the reset pose: ready_low
+          holds the finger tips at x 0.443, z 0.571. At a top face of 0.52 that is
+          a 3.3 cm gap, which 0.05 rad of arm_noise closed on 2.15% of resets;
+          0.50 opens it to ~5.2 cm. ManipulationEnv._reject_start_collisions
+          redraws the pose either way, so this is margin, not correctness.
+
+      contype=2 conaffinity=2 puts it in the "static scene" class of the bitmask
+      scheme documented in robots/panda/panda.xml, so it collides with the arm
+      (contype 1) and with the manipuland (conaffinity 3) but not with the table.
+
+      The geom name is what ManipulationEnv discovers it by -- see
+      OBSTACLE_GEOM_PREFIX. Additional barriers can be added here as obstacle_2,
+      obstacle_left and so on; the prefix match picks them all up.
+    -->
+    <geom name="obstacle" type="box" pos="0.48 0 0.45" size="0.015 0.25 0.05"
+          material="obstacle_mat" contype="2" conaffinity="2" condim="3"
+          friction="0.8 0.05 0.01"/>
+  </worldbody>
+</mujoco>

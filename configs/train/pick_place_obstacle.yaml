@@ -23,9 +23,11 @@
 #     box to the near side (x 0.37-0.43). See envs/tasks/obstacle_pick_place.py.
 #   * reward.collision_penalty -- charged per step while any arm or finger geom
 #     touches the barrier. Off (0.0) for every other task and config.
-#   * The wall itself lives in assets/panda_scene.xml as the geom named
+#   * The wall itself lives in assets/panda_scene_obstacle.xml as the geom named
 #     `obstacle`, spanning x 0.465-0.495, y +-0.25, with its top face at z 0.50.
-#     It is static, so it cannot be pushed aside.
+#     It is static, so it cannot be pushed aside. That file is DEFAULT_SCENE plus
+#     one geom by <include>, and ObstaclePickPlaceEnv defaults `scene_path` to it,
+#     so `task: pick_place` compiles a model with no barrier in it at all.
 #   * bc.demos points at a re-recorded, barrier-aware demonstration set. The
 #     baseline's demos are not reusable here and are not safe to fall back to; see
 #     the bc block at the bottom.

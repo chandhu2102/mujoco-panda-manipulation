@@ -122,14 +122,17 @@ stands. Both are 48/4, so nothing downstream catches the mix-up — see the `bc:
 | `manipulation` | the base env under its own name, for comparison | generic four-stage |
 
 `pick_place_obstacle` splits the spawn boxes across a 10 cm wall — object beyond it, goal
-before it — so every episode carries the cube over. The barrier's top face sits at z 0.50 and
+before it — so every episode carries the cube over. The barrier lives in its own scene file,
+included from the base one, so `pick_place` compiles without it (14 geoms against 15) and
+stays the task its demonstrations were recorded against. The barrier's top face sits at z 0.50 and
 the lowest goal at z 0.50, which means the crossing is *higher* than the target: the cube goes
 up over the wall and back down, rather than rising monotonically.
 
 ## Layout
 
 ```
-assets/panda_scene.xml         scene: arm + table + cube + goal marker + barrier
+assets/panda_scene.xml         scene: arm + table + cube + goal marker
+assets/panda_scene_obstacle.xml  the same, +1 barrier geom, by <include>
 assets/robots/panda/           the arm, with its own actuators and contact classes
 src/mujoco_manip/
   envs/manipulation_env.py     base env: reward stages, grasp predicate, curriculum

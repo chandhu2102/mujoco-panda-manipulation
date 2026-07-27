@@ -57,6 +57,15 @@ cosmetic difference:
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_SCENE = _REPO_ROOT / "assets" / "panda_scene.xml"
 
+OBSTACLE_SCENE = _REPO_ROOT / "assets" / "panda_scene_obstacle.xml"
+"""``DEFAULT_SCENE`` plus a static barrier, by ``<include>`` rather than by copy.
+
+Only ``envs.tasks.obstacle_pick_place.ObstaclePickPlaceEnv`` defaults here. Keeping
+the barrier out of ``DEFAULT_SCENE`` is what lets ``pick_place`` stay the task the
+400 obstacle-free demonstrations were recorded against, and therefore what keeps
+the two tasks comparable.
+"""
+
 # Grasp-predicate tolerances. See ManipulationEnv.is_grasped for why the width
 # needs a lower bound and not just an upper one.
 GRASP_WIDTH_MIN_RATIO: float = 0.5
