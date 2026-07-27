@@ -62,6 +62,29 @@ class DemoBuffer:
     clone fitted on raw observations and then run behind the normalizer is being
     evaluated on inputs scaled differently by one to two orders of magnitude in
     some dimensions, and presents as BC having done nothing at all.
+
+    Whitening is applied **lazily**, per ``sample``/``epochs`` batch, rather than
+    once in ``__init__``. ``obs_rms`` is a live object owned by the caller and
+    mutated after this buffer is built: ``NormalizeObservation`` updates it from
+    rollouts, and ``scripts/train.py`` loads a checkpoint's statistics into it
+    *after* constructing the buffer. Caching a whitened copy froze a snapshot of
+    whatever the statistics happened to be at construction, which on the
+    ``--resume`` path is an unfitted normalizer -- mean 0, and std 1 via the
+    ``var_floor`` guard, i.e. no whitening at all.
+
+    That was not a small error. Measured on a converged clone whose demo-fitted
+    statistics were loaded a few lines too late, the DAPG anchor's own NLL came out
+    at 122.9 instead of -4.30 (``scripts/pretrain_bc.py`` reports -4.267 on the
+    same data and weights), and the gradient it contributed was 35x the intended
+    one: 305 against 8.7. ``DAPGTrainer`` adds ``bc_coef * bc_loss`` to a policy
+    loss of order 1e-2, so that term dominated the actor and pulled it toward
+    reproducing demonstration actions at inputs the policy never sees. A warm start
+    worth 87% task success fell to 2% inside 40 iterations, with the episode return
+    decreasing monotonically the whole way.
+
+    Per-batch whitening costs one broadcast over ``(batch, obs_dim)`` and makes the
+    buffer track the statistics instead of a snapshot of them, which is what the
+    paragraph above always intended.
     """
 
     def __init__(
@@ -101,9 +124,14 @@ class DemoBuffer:
                 f"({self.obs_dim},)"
             )
         self.obs_rms = obs_rms
+        self.clip = clip
 
-        obs = obs_rms.normalize(raw_obs, clip=clip, dtype=np.float32)
-        self.observations = torch.as_tensor(obs, device=device)
+        # Raw, unwhitened. See the class docstring: whitening happens per batch so
+        # that a later mutation of obs_rms -- a checkpoint load, or rollout updates
+        # -- is reflected instead of silently missed.
+        self._raw_observations = torch.as_tensor(
+            np.asarray(raw_obs, dtype=np.float32), device=device
+        )
         self.actions = torch.as_tensor(actions, device=device)
         self.returns = torch.as_tensor(
             self._discounted_returns(rewards, starts, lengths, gamma), device=device
@@ -134,14 +162,59 @@ class DemoBuffer:
         return out
 
     def __len__(self) -> int:
-        return int(self.observations.shape[0])
+        return int(self._raw_observations.shape[0])
+
+    def _whiten(self, raw: Tensor) -> Tensor:
+        """Apply the *current* ``obs_rms`` to a batch of raw observations.
+
+        Mirrors ``RunningMeanStd.normalize`` exactly -- including the ``var_floor``
+        guard that leaves a constant dimension mean-centred but unscaled, and the
+        ``count < 2`` pass-through. The two have to agree, because the policy is
+        scored on demonstrations whitened here and acts on rollouts whitened there,
+        so any divergence is a silent difference between the clone's inputs and the
+        policy's. Verified equal to within float32 rounding (9.5e-7) on the fitted
+        statistics, and exactly equal at count 0.
+
+        The ``count < 2`` branch is not decoration: without it this method subtracts
+        a mean estimated from a single sample while ``normalize`` passes the same
+        input straight through, a measured max difference of 0.994. The live
+        ``NormalizeObservation`` updates one batch per step (16 envs here, so the
+        count goes 0 -> 16) and a resumed run loads a fully fitted normalizer, so
+        nothing in this pipeline lands on count 1 -- which is exactly why the
+        disagreement would have gone unnoticed.
+        """
+        rms = self.obs_rms
+        if rms.count < 2:
+            out = raw
+        else:
+            # float64 for the subtract-and-divide, then back, because that is what
+            # `normalize` does: it casts to `self.mean.dtype`. Dividing by a small
+            # std amplifies the difference between doing this in float32 and in
+            # float64 by 1/std -- at an early-run std of 2.6e-3 that showed up as a
+            # 5.1e-5 disagreement, against 9.5e-7 on fitted statistics.
+            work = raw.to(torch.float64)
+            mean = torch.as_tensor(rms.mean, dtype=torch.float64, device=raw.device)
+            std = torch.as_tensor(rms.std, dtype=torch.float64, device=raw.device)
+            out = ((work - mean) / std).to(raw.dtype)
+        if self.clip is not None:
+            out = torch.clamp(out, -float(self.clip), float(self.clip))
+        return out
+
+    @property
+    def observations(self) -> Tensor:
+        """All transitions, whitened by the current statistics.
+
+        A property rather than a stored tensor so it cannot go stale; it rebuilds
+        the full array on each access, so prefer ``sample``/``epochs`` in a loop.
+        """
+        return self._whiten(self._raw_observations)
 
     def sample(self, batch_size: int, generator: torch.Generator | None = None) -> tuple[Tensor, Tensor, Tensor]:
         """Uniform minibatch of ``(obs, actions, returns)``, sampled with replacement."""
         idx = torch.randint(
             len(self), (batch_size,), device=self.device, generator=generator
         )
-        return self.observations[idx], self.actions[idx], self.returns[idx]
+        return self._whiten(self._raw_observations[idx]), self.actions[idx], self.returns[idx]
 
     def epochs(
         self, batch_size: int, n_epochs: int, *, drop_last: bool = True
@@ -179,7 +252,11 @@ class DemoBuffer:
             order = torch.randperm(n, device=self.device)
             for start in range(0, limit, batch_size):
                 idx = order[start : start + batch_size]
-                yield self.observations[idx], self.actions[idx], self.returns[idx]
+                yield (
+                    self._whiten(self._raw_observations[idx]),
+                    self.actions[idx],
+                    self.returns[idx],
+                )
 
 
 @dataclass

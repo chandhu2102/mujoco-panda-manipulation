@@ -435,9 +435,17 @@ def main(argv: list[str] | None = None) -> int:
     # -- envs ------------------------------------------------------------- #
     venv = build_vector_env(env_cfg, seed)
     obs_rms: RunningMeanStd | None = None
+    # `freeze` stops the running statistics from being updated by rollouts, so the
+    # observation scaling stays exactly what it was when loaded. It exists for
+    # warm-started runs, where a drifting normalizer silently rewrites the inputs
+    # the cloned policy was fitted against -- see the key's documentation in
+    # configs/train/pick_place_obstacle.yaml for the measurement that motivated it
+    # (same BC weights: 87% success under the demo-fitted statistics, 0% under the
+    # same run's statistics 90 iterations later).
+    freeze_obs_norm = bool(norm_cfg.get("freeze", False))
     if norm_cfg.get("enabled", True):
         venv = NormalizeObservation(
-            venv, clip=float(norm_cfg.get("clip", 10.0)), training=True
+            venv, clip=float(norm_cfg.get("clip", 10.0)), training=not freeze_obs_norm
         )
         obs_rms = venv.obs_rms
 
@@ -579,9 +587,25 @@ def main(argv: list[str] | None = None) -> int:
         # obs_rms it was handed, which is the live one, so a throwaway loader
         # pointed at source is enough.
         if obs_rms is not None and not NormalizerCheckpoint(obs_rms, source).load():
+            if freeze_obs_norm:
+                # Frozen *and* unloaded means every observation is scaled by an
+                # all-zeros mean and unit variance for the whole run, with nothing
+                # to correct it. That trains and logs cleanly while feeding the
+                # policy garbage, so it has to be fatal rather than a warning.
+                raise SystemExit(
+                    f"normalize_obs.freeze is set but no normalizer statistics were "
+                    f"found under {source}; a frozen normalizer has no way to "
+                    f"recover from that. Run scripts/pretrain_bc.py first, or unset "
+                    f"the key."
+                )
             LOGGER.warning(
                 "resumed policy from %s but found no saved normalizer statistics; "
                 "observation scaling will differ from the original run", latest.name,
+            )
+        elif obs_rms is not None and freeze_obs_norm:
+            LOGGER.info(
+                "normalizer  frozen at count=%.0f (rollouts will not update it)",
+                obs_rms.count,
             )
         LOGGER.info("Resumed from %s at step %s", latest.name, f"{trainer.global_step:,}")
         if args.reset_action_std is not None:

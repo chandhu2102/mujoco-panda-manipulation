@@ -152,8 +152,13 @@ class ReachEnv(ManipulationEnv):
         p_limits = cfg.joint_limit_penalty * float(
             np.sum(self.robot.joint_limit_violation())
         )
+        # Wired here for the same reason it is wired in pick_place.py: this method
+        # overrides the base one wholesale, so a reach config that set
+        # collision_penalty would otherwise pass make_reward_config's key check
+        # and then be silently ignored. Zero unless a config asks.
+        p_collision, collision_terms = self._collision_terms()
 
-        reward = r_reach + r_success - p_action - p_velocity - p_limits
+        reward = r_reach + r_success - p_action - p_velocity - p_limits - p_collision
         terms = {
             "reward/reach": r_reach,
             "reward/success_bonus": r_success,
@@ -163,6 +168,7 @@ class ReachEnv(ManipulationEnv):
             "dist/eef_to_goal": distance,
             "state/at_target": float(at_target),
             "state/steps_at_target": float(self._steps_at_target),
+            **collision_terms,
         }
         return float(reward), terms
 

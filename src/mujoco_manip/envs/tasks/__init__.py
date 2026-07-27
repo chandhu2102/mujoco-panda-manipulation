@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..manipulation_env import ManipulationEnv, RewardConfig
+from .obstacle_pick_place import ObstaclePickPlaceEnv, ObstaclePickPlaceRewardConfig
 from .pick_place import PickPlaceEnv, PickPlaceRewardConfig
 from .reach import ReachEnv, ReachRewardConfig
 
@@ -28,6 +29,8 @@ __all__ = [
     "make_task",
     "make_reward_config",
     "ManipulationEnv",
+    "ObstaclePickPlaceEnv",
+    "ObstaclePickPlaceRewardConfig",
     "PickPlaceEnv",
     "PickPlaceRewardConfig",
     "ReachEnv",
@@ -39,6 +42,11 @@ __all__ = [
 TASK_REGISTRY: dict[str, type[ManipulationEnv]] = {
     "reach": ReachEnv,
     "pick_place": PickPlaceEnv,
+    # Same reward and staging as pick_place, with the spawn and goal boxes split
+    # across the static wall in assets/panda_scene.xml and the collision charge
+    # live. Registered separately rather than replacing pick_place so the
+    # converged baseline stays runnable and comparable.
+    "pick_place_obstacle": ObstaclePickPlaceEnv,
     # The base env, exposed under its own name so its generic reach->grasp->
     # lift->place staging stays runnable for comparison against pick_place.
     "manipulation": ManipulationEnv,
@@ -53,6 +61,7 @@ def available_tasks() -> list[str]:
 REWARD_CONFIG_REGISTRY: dict[str, type[RewardConfig]] = {
     "reach": ReachRewardConfig,
     "pick_place": PickPlaceRewardConfig,
+    "pick_place_obstacle": ObstaclePickPlaceRewardConfig,
     "manipulation": RewardConfig,
 }
 """Task string -> the reward dataclass that task's ``__init__`` defaults to.

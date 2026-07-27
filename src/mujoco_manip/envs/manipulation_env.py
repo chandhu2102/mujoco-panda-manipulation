@@ -66,6 +66,16 @@ GRASP_WIDTH_TOLERANCE: float = 0.012
 GRASP_LATERAL_TOLERANCE: float = 0.01
 """Allowed offset of the object centre from the jaw axis, beyond its half-width."""
 
+OBSTACLE_GEOM_PREFIX: str = "obstacle"
+"""Geoms whose name starts with this are barriers the arm is penalized for hitting.
+
+A prefix rather than one exact name, so a scene can add ``obstacle_left`` /
+``obstacle_right`` without touching this module. Matching nothing is legal and
+means "this scene has no obstacle": ``RewardConfig.collision_penalty`` then has
+nothing to multiply and every existing task keeps its reward untouched. See
+``ManipulationEnv.obstacle_contacts``.
+"""
+
 # --------------------------------------------------------------------------- #
 # Start-state (reverse) curriculum
 # --------------------------------------------------------------------------- #
@@ -115,6 +125,16 @@ and rejecting those with a single draw biased stage 3 away from exactly the
 hardest placements. Redrawing the direction -- never the magnitude -- and letting
 the IK decide reachability cut the stage-3 rollback rate from 6.5% back to
 roughly the un-offset baseline.
+"""
+
+START_COLLISION_ATTEMPTS: int = 8
+"""Arm-pose redraws allowed before a reset falls back to the un-noised pose.
+
+Generous on purpose. On the shipped geometry the per-draw rejection rate measures
+0/2000; at the tightest wall height tried it was 2.15%, where eight redraws leaves
+a ~1e-13 chance of reaching the fallback. So the budget is sized for a wall
+noticeably closer to the reset pose than the current one, which is the case where
+this matters. See ``ManipulationEnv._reject_start_collisions``.
 """
 
 CURRICULUM_SETTLE_STEPS: int = 8
@@ -254,6 +274,34 @@ class RewardConfig:
     """L2 penalty on joint velocity, for smoother trajectories."""
     joint_limit_penalty: float = 1.0
 
+    collision_penalty: float = 0.0
+    """Charged per step while any arm or finger geom touches an obstacle geom.
+
+    **Zero by default, and that default is load-bearing.** Every task and config
+    written before the obstacle scene existed keeps a bit-identical reward: a
+    scene with no ``obstacle*`` geom has nothing to charge for, and a scene that
+    has one still charges nothing until a config asks. Only
+    ``configs/train/pick_place_obstacle.yaml`` turns it on.
+
+    A *flat per-step* charge, not a one-off, and not scaled by contact count or
+    penetration depth. Contact count is a solver artefact -- a box-on-box contact
+    resolves to between one and four points depending on the incidence angle, so
+    scaling by it would make the same physical scrape cost 1x to 4x for reasons
+    the policy cannot observe or control.
+
+    On magnitude. This is a per-step charge against a per-step dense reward whose
+    full stage sum is ~19 (see ``PickPlaceRewardConfig.success``), so 5.0 makes a
+    single step of contact cost more than the entire grasp-plus-lift stack, and
+    over a 250-step horizon a stuck-against-the-wall episode accrues -1250. That
+    is the intent -- but it is also the shape of a penalty that can teach
+    avoidance of the *workspace* rather than of the wall, because the object spawn
+    box in the obstacle task sits 6.5 cm from the barrier and the shaping term
+    pulling the gripper there is worth at most 1.0/step. If reach reward collapses
+    early in a run, that is the trade going the wrong way; anneal this up from
+    ~1.0 with the ``anneal.penalties`` block rather than lowering it after the
+    fact, since the field is reachable through ``set_reward_weights``.
+    """
+
     reach_sharpness: float = 10.0
     """``k`` in the reach tanh. 10 gives most of the gradient inside ~20 cm."""
     place_sharpness: float = 10.0
@@ -303,6 +351,10 @@ class _SceneIndices:
     goal_site_id: int
     table_geom_id: int
     table_top_z: float = field(default=0.4)
+    obstacle_geom_ids: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.int32)
+    )
+    """Barrier geoms, empty for scenes without one. See ``OBSTACLE_GEOM_PREFIX``."""
 
 
 class ManipulationEnv(gym.Env):
@@ -447,6 +499,10 @@ class ManipulationEnv(gym.Env):
         self._had_grasp = False
         self._episode_success = False
         self._renderer: mujoco.Renderer | None = None
+        # Scratch state for the curriculum's collision-aware IK candidate choice.
+        # Allocated on first use and reused, so a scene with no obstacle never
+        # pays for it. See _pose_hits_obstacle.
+        self._ik_scratch: mujoco.MjData | None = None
 
         # Curriculum bookkeeping. Failures are counted rather than raised on, so
         # one bad sample cannot kill a long run -- but exposed so a
@@ -500,6 +556,20 @@ class ManipulationEnv(gym.Env):
         table_body = self.model.geom_bodyid[table_geom]
         table_z += float(self.model.body_pos[table_body][2])
 
+        # Obstacles are resolved by name *prefix* and are optional -- unlike every
+        # other index above, a missing one is not an error. Scanning names rather
+        # than requiring a fixed count is what lets one scene file serve both the
+        # baseline and the avoidance task.
+        obstacle_geoms = np.array(
+            [
+                gid
+                for gid in range(self.model.ngeom)
+                if (mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, gid) or "")
+                .startswith(OBSTACLE_GEOM_PREFIX)
+            ],
+            dtype=np.int32,
+        )
+
         return _SceneIndices(
             object_body_id=object_body,
             object_geom_id=by_name(mujoco.mjtObj.mjOBJ_GEOM, "object_geom"),
@@ -508,6 +578,7 @@ class ManipulationEnv(gym.Env):
             goal_site_id=by_name(mujoco.mjtObj.mjOBJ_SITE, "goal_site"),
             table_geom_id=table_geom,
             table_top_z=table_z,
+            obstacle_geom_ids=obstacle_geoms,
         )
 
     @property
@@ -599,6 +670,93 @@ class ManipulationEnv(gym.Env):
         lateral = float(np.linalg.norm(rel - along * jaw))
         return 0.0 < along < span and lateral < 0.5 * obj_w + GRASP_LATERAL_TOLERANCE
 
+    # -- obstacle collision ------------------------------------------------ #
+
+    @property
+    def has_obstacle(self) -> bool:
+        """Whether this scene defines any barrier geom at all."""
+        return self.scene.obstacle_geom_ids.size > 0
+
+    def obstacle_contacts(self) -> tuple[int, int]:
+        """``(robot_contacts, object_contacts)`` against the obstacle this step.
+
+        Reads ``mjData.contact``, the solver's contact list for the state left by
+        the last ``mj_step`` -- so this is "touching *now*", at the end of the
+        control interval, not "touched at any point during it". A scrape that
+        begins and ends inside one 40 ms interval of 20 substeps is therefore
+        invisible here. Sampling per control step rather than per substep is the
+        deliberate choice: the penalty has to be a function of the state the
+        policy is credited for, and a per-substep count would charge a fast
+        traverse more than a slow one for identical geometry.
+
+        Vectorized over ``ncon`` rather than looped like
+        ``PandaRobot.contacting_geoms``, because unlike the grasp predicate this
+        runs against the *whole* arm -- 11 robot geoms rather than 2 -- on every
+        step of every env.
+
+        The two counts are returned separately and only the first is charged for.
+        Robot-vs-obstacle is the arm scraping or clipping the barrier, which is
+        what the penalty is for; object-vs-obstacle is the *carried cube* clipping
+        it, which is reported as ``state/obstacle_contacts_object`` for diagnosis
+        but left unpriced -- the cube cannot reach an airborne goal by sliding
+        along a wall, so the place term already rules that path out, and pricing
+        it twice would charge the policy for the cube's own settling contact.
+
+        Returns ``(0, 0)`` immediately on a scene with no obstacle, which is the
+        path every pre-existing task takes.
+        """
+        if not self.has_obstacle:
+            return 0, 0
+        ncon = int(self.data.ncon)
+        if ncon == 0:
+            return 0, 0
+
+        geom1 = np.asarray(self.data.contact.geom1[:ncon], dtype=np.int32)
+        geom2 = np.asarray(self.data.contact.geom2[:ncon], dtype=np.int32)
+        obstacle = self.scene.obstacle_geom_ids
+
+        # A contact counts when one side is an obstacle and the other is the
+        # thing being tested for. Checked in both orders because MuJoCo orders
+        # each pair by geom id, not by role.
+        hits_obstacle = np.isin(geom1, obstacle), np.isin(geom2, obstacle)
+        robot = self.robot.robot_geom_ids
+        robot_contacts = int(
+            np.count_nonzero(
+                (hits_obstacle[0] & np.isin(geom2, robot))
+                | (hits_obstacle[1] & np.isin(geom1, robot))
+            )
+        )
+        obj = self.scene.object_geom_id
+        object_contacts = int(
+            np.count_nonzero(
+                (hits_obstacle[0] & (geom2 == obj)) | (hits_obstacle[1] & (geom1 == obj))
+            )
+        )
+        return robot_contacts, object_contacts
+
+    def _collision_terms(self) -> tuple[float, dict[str, float]]:
+        """``(penalty, terms)`` for the obstacle charge, shared by every task.
+
+        Factored out rather than inlined because all three ``compute_reward``
+        implementations override the base one wholesale, so an inlined penalty
+        would apply to whichever task happened to be edited. A config that sets
+        ``collision_penalty`` on a task that silently ignored it is precisely the
+        class of failure ``make_reward_config``'s unknown-key check exists to
+        prevent, and it would slip straight past that check.
+
+        The charge is a flat ``collision_penalty`` while contact is present, not a
+        multiple of the contact count -- see the field's docstring.
+        """
+        robot_hits, object_hits = self.obstacle_contacts()
+        in_collision = robot_hits > 0
+        penalty = self.reward_cfg.collision_penalty * float(in_collision)
+        return penalty, {
+            "reward/collision_penalty": -penalty,
+            "state/in_collision": float(in_collision),
+            "state/obstacle_contacts_robot": float(robot_hits),
+            "state/obstacle_contacts_object": float(object_hits),
+        }
+
     # -- reward ------------------------------------------------------------ #
 
     def set_reward_weights(self, **weights: float) -> dict[str, float]:
@@ -677,10 +835,11 @@ class ManipulationEnv(gym.Env):
         p_limits = cfg.joint_limit_penalty * float(
             np.sum(self.robot.joint_limit_violation())
         )
+        p_collision, collision_terms = self._collision_terms()
 
         reward = (
             r_reach + r_grasp + r_lift + r_place + r_success
-            - p_action - p_velocity - p_limits
+            - p_action - p_velocity - p_limits - p_collision
         )
         terms = {
             "reward/reach": r_reach,
@@ -695,6 +854,7 @@ class ManipulationEnv(gym.Env):
             "dist/object_to_goal": d_place,
             "state/lift_height": height,
             "state/gripper_width": self.robot.gripper_width,
+            **collision_terms,
         }
         return float(reward), terms
 
@@ -773,6 +933,8 @@ class ManipulationEnv(gym.Env):
         # target is the world origin, not the object. (Measured: 0/60 seeds.)
         mujoco.mj_forward(self.model, self.data)
 
+        self._reject_start_collisions()
+
         stage = self._roll_curriculum_stage()
         if stage:
             stage = self._apply_curriculum_seed(stage, object_pos, object_yaw)
@@ -811,6 +973,49 @@ class ManipulationEnv(gym.Env):
                 "curriculum/prob": float(self.curriculum_prob),
                 "curriculum/seeded": float(bool(stage)), **terms}
         return obs, info
+
+    def _reject_start_collisions(self) -> None:
+        """Redraw the reset arm pose until it is not touching an obstacle.
+
+        Only the arm is redrawn. The object and goal boxes are placed clear of the
+        barrier by construction (see ``OBSTACLE_PICK_PLACE_RANDOMIZATION``), so
+        the only thing ``arm_noise`` can push into a wall is the arm.
+
+        Why this exists rather than only a wall placed clear of the reset pose.
+        ``ready_low`` holds the finger tips at x 0.443, z 0.571, hanging down toward
+        the near top corner of the barrier, and ``RandomizationConfig.arm_noise``
+        of 0.05 rad swings them. At an earlier wall top of z 0.52 that gap was
+        3.3 cm and the noise closed it on 2.15% of draws -- measured over 2000
+        resets, every one of them a finger contact. Episodes like that start
+        already paying ``collision_penalty`` for a state the policy did not choose,
+        teaching the value function that the initial state is worth -5.0/step, on
+        one episode in fifty.
+
+        The shipped wall top of z 0.50 opens that gap to 5.2 cm and measures 0/2000,
+        so on the current geometry this method is a guarantee rather than a code
+        path that runs. It is kept because the guarantee is the point: it holds for
+        any wall placement and any ``arm_noise``, so neither can silently
+        reintroduce the problem the way tuning the wall height alone would.
+
+        Bounded, then falls back to the un-noised pose -- which
+        ``PandaRobot._validate_reset_poses`` has already proven collision-free at
+        construction, so the fallback cannot itself start in contact. A no-op on
+        scenes with no obstacle, which is every task but this one.
+        """
+        if not self.has_obstacle:
+            return
+        for _ in range(START_COLLISION_ATTEMPTS):
+            if self.obstacle_contacts()[0] == 0:
+                return
+            self.robot.reset(
+                self.reset_pose, gripper_open=True,
+                noise=self.rand_cfg.arm_noise, rng=self.np_random,
+            )
+            mujoco.mj_forward(self.model, self.data)
+        if self.obstacle_contacts()[0] == 0:
+            return
+        self.robot.reset(self.reset_pose, gripper_open=True, noise=0.0)
+        mujoco.mj_forward(self.model, self.data)
 
     # -- start-state curriculum -------------------------------------------- #
 
@@ -915,6 +1120,13 @@ class ManipulationEnv(gym.Env):
                 # Relocating the object invalidates the kinematics cache the IK
                 # target is about to be read from.
                 mujoco.mj_forward(self.model, self.data)
+                # A 7.5 cm displacement from a goal near the barrier can put the
+                # cube *inside* it. Redraw the direction rather than solving IK to
+                # a target embedded in a wall -- this is the same reason the loop
+                # redraws on an unreachable target, and it reuses the same budget.
+                if self.obstacle_contacts()[1] > 0:
+                    result = None
+                    continue
 
             # Read back from the (possibly relocated) object rather than
             # recomputing from the goal, so the IK target tracks wherever the
@@ -947,6 +1159,12 @@ class ManipulationEnv(gym.Env):
                     object_pos, object_yaw,
                     f"stage {stage} ({spec.name}): pre-grasp hover is already "
                     f"touching the object at {spec.hover:.3f} m clearance",
+                )
+            if self._seed_hits_obstacle():
+                return self._curriculum_seed_failed(
+                    object_pos, object_yaw,
+                    f"stage {stage} ({spec.name}): seeded state is in contact with "
+                    f"an obstacle",
                 )
             return stage
 
@@ -982,7 +1200,34 @@ class ManipulationEnv(gym.Env):
                 f"(width={self.robot.gripper_width:.4f} m, "
                 f"object_width={self.object_width:.4f} m)",
             )
+        if self._seed_hits_obstacle():
+            return self._curriculum_seed_failed(
+                object_pos, object_yaw,
+                f"stage {stage} ({spec.name}): settled state is in contact with an "
+                f"obstacle",
+            )
         return stage
+
+    def _seed_hits_obstacle(self) -> bool:
+        """Whether the state just seeded is already touching a barrier.
+
+        Checked because ``_solve_grasp_ik`` is a *kinematic* solve with joint
+        limits as its only constraint: nothing in it knows an obstacle exists, so
+        on the avoidance scene it can and does return poses that put a link
+        through the wall. Seeding one is worse than failing to seed. The episode
+        would begin inside a penetration the solver then resolves as an impulse,
+        and it would begin already paying ``collision_penalty`` -- teaching the
+        value function that the seeded stages are where reward goes to die, which
+        is the exact opposite of what a reverse curriculum is for.
+
+        The object side is checked as well, for stage 3 specifically: it relocates
+        the cube to the goal plus ``CURRICULUM_GOAL_OFFSET``, and a 7.5 cm
+        displacement from a goal near the barrier can land the cube inside it.
+
+        A no-op returning False on any scene without an obstacle, so the baseline
+        curriculum's seed accept/reject behaviour is unchanged.
+        """
+        return any(count > 0 for count in self.obstacle_contacts())
 
     def _solve_grasp_ik(self, target_pos: np.ndarray, object_yaw: float) -> Any:
         """Top-down grasp IK at ``target_pos``, trying all four face yaws.
@@ -993,10 +1238,29 @@ class ManipulationEnv(gym.Env):
         measured: 5/60 seeds lost to wrist limits at a single candidate, 0/60
         across all four. Returns the last result when none converge, so the
         caller can report the closest miss.
+
+        On an obstacle scene a converged solve is not automatically a *usable*
+        one, so the candidates are additionally filtered on collision. The four
+        yaws are equivalent as grips but emphatically not as swept volumes: the
+        hand geom is 10 cm long along the jaw axis against 6 cm across it, so a
+        quarter-turned wrist lays that long axis across the barrier instead of
+        parallel to it. Measured against a deliberately tight variant of this scene
+        -- the wall 3 cm further from the robot, at x 0.495-0.525, with objects
+        spawning from x 0.56 -- taking the first *kinematically* converged candidate
+        put a robot geom in contact with the wall on 54 of 235 seeds, 109 of those
+        contacts on ``hand_geom`` alone; filtering the same four yaws on collision
+        cut it to 44. The wall then moved to buy the remaining clearance (see the
+        asset), and on the shipped geometry the two effects together leave the
+        seeder at 4 of 235, at or below its obstacle-free baseline.
+
+        The fallback if every candidate collides is the first converged one, so this
+        can only improve on the previous behaviour; ``_apply_curriculum_seed`` still
+        rejects it downstream.
         """
-        result = None
+        last: Any = None
+        first_converged: Any = None
         for quat in self._grasp_quat_candidates(object_yaw):
-            result = solve_site_ik(
+            last = solve_site_ik(
                 self.model,
                 self.robot.idx.eef_site_id,
                 self.robot.idx.arm_qpos_adr,
@@ -1008,9 +1272,58 @@ class ManipulationEnv(gym.Env):
                 qpos_full=self.data.qpos,
                 rot_tolerance=CURRICULUM_IK_ROT_TOLERANCE,
             )
-            if result:
-                break
-        return result
+            if not last:
+                continue
+            if not self._pose_hits_obstacle(last.qpos):
+                return last
+            if first_converged is None:
+                first_converged = last
+        # Either every converged candidate collides -- hand the best one back and
+        # let _apply_curriculum_seed reject it -- or none converged, in which case
+        # `last` is the closest miss the caller reports.
+        return first_converged if first_converged is not None else last
+
+    def _pose_hits_obstacle(self, arm_qpos: np.ndarray) -> bool:
+        """Whether the arm at ``arm_qpos`` touches an obstacle, jaw wide open.
+
+        Evaluated on a scratch ``MjData`` so it cannot disturb the live state --
+        the caller is mid-reset and ``self.data`` still holds the pose the IK was
+        seeded from. Same technique as ``PandaRobot.pose_collisions``, but scoped
+        to obstacle pairs only: the table and the object are *expected* to be in
+        contact around a grasp, and rejecting those would reject every seed.
+
+        The scratch buffer is allocated once and reused. Allocating an ``MjData``
+        per candidate would mean up to four allocations per reset on every one of
+        16 training envs, which is a real cost for a check that is pure kinematics.
+
+        Open jaw rather than the grasp width, because this runs *before* the
+        clamped stages squeeze: a wider jaw is the conservative test, since it can
+        only add contact, never hide it.
+        """
+        if not self.has_obstacle:
+            return False
+        if self._ik_scratch is None:
+            self._ik_scratch = mujoco.MjData(self.model)
+        scratch = self._ik_scratch
+        scratch.qpos[:] = self.data.qpos
+        scratch.qpos[self.robot.idx.arm_qpos_adr] = arm_qpos
+        scratch.qpos[self.robot.idx.finger_qpos_adr] = 0.5 * GRIPPER_MAX_WIDTH
+        scratch.qvel[:] = 0.0
+        mujoco.mj_forward(self.model, scratch)
+
+        obstacle = self.scene.obstacle_geom_ids
+        robot = self.robot.robot_geom_ids
+        ncon = int(scratch.ncon)
+        if ncon == 0:
+            return False
+        geom1 = np.asarray(scratch.contact.geom1[:ncon], dtype=np.int32)
+        geom2 = np.asarray(scratch.contact.geom2[:ncon], dtype=np.int32)
+        return bool(
+            np.any(
+                (np.isin(geom1, obstacle) & np.isin(geom2, robot))
+                | (np.isin(geom2, obstacle) & np.isin(geom1, robot))
+            )
+        )
 
     def _curriculum_goal_offset(self) -> np.ndarray:
         """Isotropic displacement of exactly ``CURRICULUM_GOAL_OFFSET`` metres.
