@@ -47,6 +47,12 @@ CONFIG_ROOT = _REPO_ROOT / "configs" / "train"
 TASK_CONFIGS: dict[str, Path] = {
     "reach": CONFIG_ROOT / "reach.yaml",
     "pick_place": CONFIG_ROOT / "pick_place.yaml",
+    # Note this is the only pick_place variant whose default config is the one
+    # that actually converges. `pick_place` maps to the torque config, which is
+    # the honest default for that task string but reached 0% over 6.4M steps --
+    # configs/train/pick_place_osc_bc.yaml is the one to reach for, and it has no
+    # task string of its own because it trains the same `pick_place` env.
+    "pick_place_obstacle": CONFIG_ROOT / "pick_place_obstacle.yaml",
 }
 
 
